@@ -22,6 +22,7 @@ object PromptBuilder {
         }
 
         builder.append("\nGenerate outputs with **clear markers**:\n\n")
+        builder.append("IMPORTANT: Don't add any comment, docs or explanations")
 
         builder.append("### BASE_CLASS_START\n")
         builder.append("Generate an abstract TypeScript class named Base${featureFlowName.capitalize()}.\n")

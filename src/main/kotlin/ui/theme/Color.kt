@@ -1,3 +1,3 @@
 package ui.theme
 
-const val BLUE = 0x687EF5
+const val BLUE = 0xFF687EF5
