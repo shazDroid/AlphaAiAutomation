@@ -19,6 +19,7 @@ object OllamaClient {
     private val mapper = ObjectMapper().registerKotlinModule()
 
     fun sendPromptStreaming(prompt: String, onChunk: (String) -> Unit, onComplete: () -> Unit) {
+        println("Request body: \n$prompt")
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val payload = mapOf(
             "model" to "gemma3:latest",
@@ -26,7 +27,7 @@ object OllamaClient {
                 mapOf("role" to "system", "content" to "You are a test automation code generator."),
                 mapOf("role" to "user", "content" to prompt)
             ),
-            "stream" to true
+            "stream" to false
         )
 
         val body = RequestBody.create(mediaType, ObjectMapper().writeValueAsString(payload))

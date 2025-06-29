@@ -1,5 +1,6 @@
 package ui
 
+import KottieAnimation
 import adb.AdbExecutor
 import adb.UiDumpParser
 import adb.UiDumpParser.cleanUiDumpXml
@@ -25,12 +26,15 @@ import androidx.compose.ui.unit.TextUnitType
 import androidx.compose.ui.unit.dp
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import contentScale.ContentScale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kottieComposition.KottieCompositionSpec
 import model.UiElement
 import ui.component.AlphaButton
 import ui.component.AlphaInputText
 import ui.component.AlphaInputTextMultiline
+import ui.component.AlphaTabRow
 import ui.theme.BLUE
 import util.CodeBlock
 import util.OllamaClient
@@ -39,6 +43,7 @@ import util.TargetMapper
 import util.extractCodeBetweenMarkers
 import yaml.TestFlow
 import yaml.YamlFlowLoader
+import java.io.File
 
 @Preview
 @Composable
@@ -48,7 +53,7 @@ fun AppUI() {
     var selectedDevice by remember { mutableStateOf("") }
     var packageName by remember { mutableStateOf("com.shazdroid.messapp") }
     var uiElements by remember { mutableStateOf(listOf<UiElement>()) }
-    var isDropdownExpanded by remember { mutableStateOf(false) }
+    var showAnimation by remember { mutableStateOf(true) }
 
     var yamlContent by remember { mutableStateOf("") }
     var parsedFlow by remember { mutableStateOf<TestFlow?>(null) }
@@ -67,6 +72,10 @@ fun AppUI() {
     var featureFileOutput by remember { mutableStateOf("") }
 
     val scope = rememberCoroutineScope()
+
+    val inputStream = {}.javaClass.getResourceAsStream("/drawable/robot_animation.json")
+        ?: throw IllegalArgumentException("Resource not found")
+    val json = inputStream.bufferedReader().use { it.readText() }
 
     Row(modifier = Modifier.fillMaxSize()) {
 
@@ -162,6 +171,7 @@ fun AppUI() {
 
             AnimatedVisibility(selectedDevice.isNotEmpty()) {
                 CaptureUiDump(isCaptureDone = isCapturedDone, onClick = {
+                    isCapturedDone = false
                     scope.launch(Dispatchers.IO) {
                         val xml = UiDumpParser.getUiDumpXml(selectedDevice)
                         val cleanedXml = cleanUiDumpXml(xml)
@@ -192,6 +202,7 @@ fun AppUI() {
             Spacer(modifier = Modifier.height(16.dp))
 
             AlphaButton(isLoading = isLoading, text = "Generate with AI", onClick = {
+                showAnimation = true
 
                 if (yamlContent.isBlank()) {
                     baseClassOutput = "⚠️ Please enter YAML flow first."
@@ -234,6 +245,7 @@ fun AppUI() {
                                 }
                             },
                             onComplete = {
+                                showAnimation = false
                                 isLoading = false
                                 val outputText = fullOutput.toString()
                                 println("Full text output: $outputText")
@@ -252,19 +264,6 @@ fun AppUI() {
                 }
 
             })
-
-//            Spacer(modifier = Modifier.height(16.dp))
-//            Text("UI Elements")
-//
-//            LazyColumn(
-//                modifier = Modifier
-//                    .fillMaxWidth()
-//                    .height(200.dp)
-//            ) {
-//                items(uiElements) { element ->
-//                    Text("${element.clazz} | ${element.resourceId} | ${element.text}")
-//                }
-//            }
         }
 
         // Right Pane
@@ -273,22 +272,29 @@ fun AppUI() {
                 .weight(0.6f)
                 .padding(16.dp)
         ) {
-            TabRow(selectedTabIndex = selectedTab) {
-                tabTitles.forEachIndexed { index, title ->
-                    Tab(
-                        selected = selectedTab == index,
-                        onClick = { selectedTab = index }
-                    ) {
-                        Text(title, modifier = Modifier.padding(8.dp))
-                    }
-                }
-            }
+            if (showAnimation) {
+                KottieAnimation(
+                    composition = KottieCompositionSpec.JsonString(json),
+                    modifier = Modifier.size(200.dp),
+                    progress = {
+                        50f
+                    },
+                    backgroundColor = Color.Transparent,
+                    contentScale = ContentScale.Fit
+                )
+            } else {
+                AlphaTabRow(
+                    tabs = tabTitles,
+                    selectedTabIndex = selectedTab,
+                    onTabSelected = { selectedTab = it }
+                )
 
-            when (selectedTab) {
-                0 -> CodeBlock(baseClassOutput, "typescript")
-                1 -> CodeBlock(platformClassOutput, "typescript")
-                2 -> CodeBlock(stepDefinitionsOutput, "typescript")
-                3 -> CodeBlock(featureFileOutput, "gherkin")
+                when (selectedTab) {
+                    0 -> CodeBlock(baseClassOutput, "typescript")
+                    1 -> CodeBlock(platformClassOutput, "typescript")
+                    2 -> CodeBlock(stepDefinitionsOutput, "typescript")
+                    3 -> CodeBlock(featureFileOutput, "gherkin")
+                }
             }
         }
     }
@@ -391,8 +397,8 @@ fun CaptureUiDump(
             .background(color = Color(0xFFEDF3FF), shape = RoundedCornerShape(size = 12.dp)).padding(12.dp)
     ) {
         Column() {
-            var packageName by remember { mutableStateOf("") }
-            var flowFeatureName by remember { mutableStateOf("") }
+            var packageName by remember { mutableStateOf("com.shazdroid.messapp") }
+            var flowFeatureName by remember { mutableStateOf("Login") }
 
             PackageInput(hint = "Package Name", onTextChange = { value ->
                 packageName = value
@@ -409,9 +415,27 @@ fun CaptureUiDump(
             AnimatedVisibility(isCaptureDone) {
                 isLoading = false
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Image(painter = painterResource("drawable/success.svg"), contentDescription = null)
+                    Image(
+                        modifier = Modifier.size(24.dp),
+                        painter = painterResource("drawable/success.svg"),
+                        contentDescription = null
+                    )
                     Spacer(modifier = Modifier.padding(4.dp))
-                    Text(text = "Captured UI Dump", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                    Row() {
+                        Text(
+                            modifier = Modifier.weight(1f),
+                            text = "Captured UI Dump",
+                            fontWeight = MaterialTheme.typography.h6.fontWeight
+                        )
+
+                        Image(
+                            modifier = Modifier
+                                .size(24.dp)
+                                .clickable {
+                                    onClick.invoke()
+                                }, painter = painterResource("drawable/restart.svg"), contentDescription = null
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.padding(4.dp))
             }
@@ -453,4 +477,17 @@ fun FlowInput(hint: String, onTextChange: (String) -> Unit) {
         hint = hint
     )
 }
+
+fun loadAnimationFromResources(path: String): File {
+    val inputStream = {}.javaClass.getResourceAsStream(path)
+        ?: throw IllegalArgumentException("Resource not found: $path")
+    val tempFile = kotlin.io.path.createTempFile(suffix = ".json").toFile()
+    inputStream.use { input ->
+        tempFile.outputStream().use { output ->
+            input.copyTo(output)
+        }
+    }
+    return tempFile
+}
+
 
