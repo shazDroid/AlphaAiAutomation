@@ -27,7 +27,8 @@ object OllamaClient {
                 mapOf("role" to "system", "content" to "You are a test automation code generator."),
                 mapOf("role" to "user", "content" to prompt)
             ),
-            "stream" to false
+            "stream" to false,
+            "temperature" to 0.5
         )
 
         val body = RequestBody.create(mediaType, ObjectMapper().writeValueAsString(payload))

@@ -1,5 +1,6 @@
 package ui
 
+import CodeBlock
 import KottieAnimation
 import adb.AdbExecutor
 import adb.UiDumpParser
@@ -36,7 +37,6 @@ import ui.component.AlphaInputText
 import ui.component.AlphaInputTextMultiline
 import ui.component.AlphaTabRow
 import ui.theme.BLUE
-import util.CodeBlock
 import util.OllamaClient
 import util.PromptBuilder
 import util.TargetMapper

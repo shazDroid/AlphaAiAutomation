@@ -30,7 +30,8 @@ object PromptBuilder {
         val actionableElements = uiElements.filter { element ->
             val resourceMatch = element.resourceId in yamlTargetIds || element.effectiveTarget in yamlTargetIds
             val textMatch = element.text.lowercase() in yamlTargetTexts
-            resourceMatch || textMatch
+            val effectiveTargetMatch = element.effectiveTarget in yamlEffectiveTargets
+            resourceMatch || textMatch || effectiveTargetMatch
         }
 
 
@@ -60,6 +61,7 @@ object PromptBuilder {
         builder.append("public abstract get elementName(): ChainablePromise<WebdriverIO.Element>;\n")
         builder.append("where elementName is meaningful based on the provided aliases.\n")
         builder.append("Wrap the code in a TypeScript fenced code block.\n")
+        builder.append("Include ALL actionable elements: input fields, buttons, text views, switches, etc.\n")
         builder.append("IMPORTANT: Ensure you include the closing marker ### BASE_CLASS_END after the code block.\n")
         builder.append("### BASE_CLASS_END\n\n")
 
@@ -75,6 +77,8 @@ object PromptBuilder {
         builder.append("Example with index fallback: return $('(//android.widget.EditText)[2]');\n")
         builder.append("Example with bounds fallback: return $('//android.widget.EditText[@bounds=\"[100,200][300,400]\"]');\n")
         builder.append("Wrap the code in a TypeScript fenced code block.\n")
+        builder.append("Include examples for EditText, Buttons, and other UI elements.\n")
+        builder.append("Example for button: return $('id=com.example.app:id/loginButton');\n")
         builder.append("IMPORTANT: Ensure you include the closing marker ### PLATFORM_CLASS_END after the code block.\n")
         builder.append("### PLATFORM_CLASS_END\n\n")
 
