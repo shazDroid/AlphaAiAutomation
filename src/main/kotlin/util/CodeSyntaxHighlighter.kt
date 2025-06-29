@@ -24,7 +24,7 @@ fun syntaxHighlight(code: String, language: String = "typescript"): AnnotatedStr
             var index = code.indexOf(keyword)
             while (index >= 0) {
                 addStyle(
-                    style = SpanStyle(color = Color(0xFF569CD6)), // Blue-ish keyword color
+                    style = SpanStyle(color = Color(0xFF569CD6)),
                     start = index,
                     end = index + keyword.length
                 )
@@ -36,7 +36,7 @@ fun syntaxHighlight(code: String, language: String = "typescript"): AnnotatedStr
         val stringRegex = Regex("\".*?\"|'.*?'")
         stringRegex.findAll(code).forEach { matchResult ->
             addStyle(
-                style = SpanStyle(color = Color(0xFFCE9178)), // Orange string color
+                style = SpanStyle(color = Color(0xFFCE9178)),
                 start = matchResult.range.first,
                 end = matchResult.range.last + 1
             )

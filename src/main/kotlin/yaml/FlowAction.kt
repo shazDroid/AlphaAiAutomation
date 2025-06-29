@@ -3,9 +3,9 @@ package yaml
 data class FlowAction(
     val action: String,
     val target_text: String? = null,
-    val target: String? = null,
+    var target: String? = null,
     val value: String? = null,
-    val packageName: String? = null // add this line
+    val packageName: String? = null
 )
 
 

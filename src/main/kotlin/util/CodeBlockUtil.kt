@@ -20,7 +20,7 @@ fun CodeBlock(code: String, language: String = "typescript") {
         text = highlighted,
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFF1E1E1E)) // VSCode dark background
+            .background(Color(0xFF1E1E1E))
             .padding(8.dp)
             .verticalScroll(rememberScrollState()),
         fontFamily = FontFamily.Monospace,

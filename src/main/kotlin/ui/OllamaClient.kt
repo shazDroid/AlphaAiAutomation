@@ -11,7 +11,7 @@ object OllamaClient {
     private val client = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS) // adjust based on your generation time
+        .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
 

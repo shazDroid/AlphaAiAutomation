@@ -11,14 +11,14 @@ import androidx.compose.ui.*
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.*
 
-private const val BLUE = 0xFF687EF5.toInt() // Define your BLUE constant
+private const val BLUE = 0xFF687EF5.toInt()
 
 @Composable
 fun AlphaTabRow(
     tabs: List<String>,
     selectedTabIndex: Int,
     onTabSelected: (Int) -> Unit,
-    isLoadingTab: (Int) -> Boolean = { false } // optional loading per tab
+    isLoadingTab: (Int) -> Boolean = { false }
 ) {
     Row(
         modifier = Modifier
@@ -84,7 +84,7 @@ fun PreviewAlphaTabRow() {
     var selectedTab by remember { mutableStateOf(0) }
 
     val tabs = listOf("Tab 1", "Tab 2", "Tab 3")
-    val loadingTabs = setOf(1) // Tab index 1 is loading as example
+    val loadingTabs = setOf(1)
 
     AlphaTabRow(
         tabs = tabs,

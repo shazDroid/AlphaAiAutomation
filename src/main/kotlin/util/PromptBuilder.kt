@@ -1,7 +1,6 @@
 package util
 
 import model.UiElement
-import yaml.FlowAction
 import yaml.TestFlow
 
 object PromptBuilder {
@@ -9,7 +8,6 @@ object PromptBuilder {
         val builder = StringBuilder()
 
         builder.append("You are a test automation code generator.\n\n")
-
         builder.append("Feature Flow Name: ").append(featureFlowName).append("\n\n")
 
         builder.append("Here is the YAML flow (each action has index, action type, target resource ID, and text for clarity):\n")
@@ -25,21 +23,27 @@ object PromptBuilder {
         // Extract unique target resourceIds and target texts from YAML flow
         val yamlTargetIds = flow.flow.mapNotNull { it.target }.toSet()
         val yamlTargetTexts = flow.flow.mapNotNull { it.target_text?.lowercase() }.toSet()
+        val yamlEffectiveTargets = flow.flow.mapNotNull { it.target }.toSet()
 
-        // Filter actionable UI elements only IF they are in YAML targets
+
+        // Filter actionable UI elements only if they are in YAML targets
         val actionableElements = uiElements.filter { element ->
             val resourceMatch = element.resourceId in yamlTargetIds
+            val effectiveTargetMatch = element.effectiveTarget in yamlEffectiveTargets
             val textMatch = element.text.lowercase() in yamlTargetTexts
-            resourceMatch || textMatch
+            resourceMatch || effectiveTargetMatch || textMatch
         }
+
 
         builder.append("Here are the actionable extracted UI elements with aliases for page object getters:\n")
         actionableElements.forEach { element ->
             val alias = buildAlias(element)
             builder.append("- Alias: $alias\n")
-            builder.append("  Resource ID: ${element.resourceId}\n")
+            builder.append("  Resource ID: ${element.effectiveTarget ?: element.resourceId}\n")
             builder.append("  Class: ${element.clazz}\n")
             builder.append("  Text: ${element.text}\n")
+            builder.append("  Bounds: ${element.bounds}\n")
+            builder.append("  Index: ${element.index}\n")
         }
 
         builder.append("\nGenerate outputs with **clear markers**:\n\n")
@@ -62,11 +66,14 @@ object PromptBuilder {
         // PLATFORM CLASS
         builder.append("### PLATFORM_CLASS_START\n")
         builder.append("Generate a TypeScript class named Android${featureFlowName.capitalize()}Page that extends Base${featureFlowName.capitalize()}.\n")
-        builder.append("Override each getter with its actual locator using Appium/WebdriverIO selectors in this priority:\n")
-        builder.append("1. If resourceId is present, use $('id=package:id').\n")
-        builder.append("2. If resourceId is null but text is present, use XPath e.g. $('//className[@text=\"text\"]').\n")
-        builder.append("Example for id: return $('id=com.shazdroid.messapp:id/shazButton');\n")
-        builder.append("Example for text: return $('//android.widget.TextView[@text=\"Sign up now\"]');\n")
+        builder.append("Override each getter with its actual locator using Appium/WebdriverIO selectors based on the following rules:\n")
+        builder.append("1. If resourceId is not blank, use $('id=package:id').\n")
+        builder.append("2. If resourceId is blank but text is present, use XPath based on text.\n")
+        builder.append("3. If both resourceId and text are blank, use XPath with index or bounds as fallback.\n")
+        builder.append("Example for unique id: return $('id=com.shazdroid.messapp:id/shazButton');\n")
+        builder.append("Example for text only: return $('//android.widget.EditText[@text=\"Username\"]');\n")
+        builder.append("Example with index fallback: return $('(//android.widget.EditText)[2]');\n")
+        builder.append("Example with bounds fallback: return $('//android.widget.EditText[@bounds=\"[100,200][300,400]\"]');\n")
         builder.append("Wrap the code in a TypeScript fenced code block.\n")
         builder.append("IMPORTANT: Ensure you include the closing marker ### PLATFORM_CLASS_END after the code block.\n")
         builder.append("### PLATFORM_CLASS_END\n\n")

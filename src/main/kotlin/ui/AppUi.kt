@@ -170,13 +170,61 @@ fun AppUI() {
             Spacer(modifier = Modifier.height(16.dp))
 
             AnimatedVisibility(selectedDevice.isNotEmpty()) {
+                Text(text = "Yaml Editor", fontWeight = MaterialTheme.typography.h6.fontWeight)
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            AnimatedVisibility(selectedDevice.isNotEmpty()) {
+                AlphaInputTextMultiline(
+                    value = yamlContent,
+                    onValueChange = { yamlContent = it },
+                    hint = "Enter YAML flow here",
+                    backgroundColor = Color(0xFFEDF3FF)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            AnimatedVisibility(yamlContent.isNotEmpty()) {
                 CaptureUiDump(isCaptureDone = isCapturedDone, onClick = {
                     isCapturedDone = false
                     scope.launch(Dispatchers.IO) {
+
+                        // ✅ Parse YAML here to initialize parsedFlow
+                        if (yamlContent.isNotBlank()) {
+                            try {
+                                val flow = YamlFlowLoader.loadFlowFromString(yamlContent)
+                                parsedFlow = flow
+                                println("Parsed flow loaded before UI dump: $parsedFlow")
+                            } catch (e: Exception) {
+                                println("YAML parsing error: ${e.message}")
+                            }
+                        } else {
+                            println("YAML content is blank. parsedFlow remains null.")
+                        }
+
                         val xml = UiDumpParser.getUiDumpXml(selectedDevice)
+                        println("XML Dump: \n $xml")
+
                         val cleanedXml = cleanUiDumpXml(xml)
-                        val parsed = UiDumpParser.parseUiDump(cleanedXml)
+                        val parsed = UiDumpParser.parseUiDump(cleanedXml).toMutableList()
+
+                        // Dynamic resolution for text_input actions using parsedFlow
+                        parsedFlow?.flow?.forEach { action ->
+                            if (action.action == "input_text" && !action.target_text.isNullOrEmpty()) {
+                                val editText = UiDumpParser.findEditTextForLabel(cleanedXml, action.target_text)
+                                if (editText != null) {
+                                    println("Resolved EditText for target '${action.target_text}': $editText")
+                                    parsed.add(editText)
+                                } else {
+                                    println("No EditText found for target '${action.target_text}'")
+                                }
+                            }
+                        }
+
                         uiElements = parsed
+                        println("UI Dump (updated): \n$uiElements")
                         isCapturedDone = true
                     }
                 }, onPackageNameChange = {
@@ -186,18 +234,7 @@ fun AppUI() {
                 })
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
 
-            Text(text = "Yaml Editor", fontWeight = MaterialTheme.typography.h6.fontWeight)
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            AlphaInputTextMultiline(
-                value = yamlContent,
-                onValueChange = { yamlContent = it },
-                hint = "Enter YAML flow here",
-                backgroundColor = Color(0xFFEDF3FF)
-            )
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -205,7 +242,7 @@ fun AppUI() {
                 showAnimation = true
 
                 if (yamlContent.isBlank()) {
-                    baseClassOutput = "⚠️ Please enter YAML flow first."
+                    baseClassOutput = "Please enter YAML flow first."
                     return@AlphaButton
                 }
 
@@ -213,21 +250,22 @@ fun AppUI() {
                     isLoading = true
 
                     try {
-                        val buffer = StringBuilder()
                         val fullOutput = StringBuilder()
 
 
                         var flow = YamlFlowLoader.loadFlowFromString(yamlContent)
-                        flow = TargetMapper.mapTargets(flow, uiElements)
+                        val (updatedFlow, actionableElements) = TargetMapper.mapTargets(flow, uiElements)
+
                         parsedFlow = flow
 
-                        // Clear outputs before streaming
+
                         baseClassOutput = ""
                         platformClassOutput = ""
                         stepDefinitionsOutput = ""
                         featureFileOutput = ""
 
-                        val prompt = PromptBuilder.buildPrompt(featureFlowName, flow, uiElements)
+                        val prompt = PromptBuilder.buildPrompt(featureFlowName, updatedFlow, actionableElements)
+
 
                         OllamaClient.sendPromptStreaming(
                             prompt,
@@ -239,7 +277,6 @@ fun AppUI() {
                                         val content = jsonNode["message"]?.get("content")?.asText() ?: ""
                                         fullOutput.append(content)
                                     } catch (e: Exception) {
-                                        // ignore parsing error; buffer grows until valid JSON
                                         println("Chunk parsing issue: ${e.message}")
                                     }
                                 }
