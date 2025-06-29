@@ -85,6 +85,8 @@ object PromptBuilder {
         // STEP DEFINITIONS
         builder.append("### STEP_DEFS_START\n")
         builder.append("Generate TypeScript step definitions using WebdriverIO + Cucumber syntax.\n")
+        builder.append("Do not generate any comments or placeholder examples.\n")
+        builder.append("Output only actual executable step definitions.\n")
         builder.append("Follow these examples:\n")
         builder.append("When('I enter the password as {string}', async (password) => {\n")
         builder.append("  const passwordField = await loginPage.passwordField;\n")

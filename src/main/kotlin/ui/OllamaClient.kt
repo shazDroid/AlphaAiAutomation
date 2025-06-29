@@ -22,13 +22,13 @@ object OllamaClient {
         println("Request body: \n$prompt")
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val payload = mapOf(
-            "model" to "gemma3:latest",
+            "model" to "deepseek-coder:6.7b",
             "messages" to listOf(
                 mapOf("role" to "system", "content" to "You are a test automation code generator."),
                 mapOf("role" to "user", "content" to prompt)
             ),
             "stream" to false,
-            "temperature" to 0.5
+            "temperature" to 0.3
         )
 
         val body = RequestBody.create(mediaType, ObjectMapper().writeValueAsString(payload))
