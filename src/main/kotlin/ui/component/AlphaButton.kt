@@ -23,13 +23,14 @@ import ui.theme.BLUE
 @Preview
 @Composable
 fun AlphaButton(
+    modifier: Modifier = Modifier,
     isLoading: Boolean = false,
     text: String,
     onClick: () -> Unit
 ) {
     Button(
         onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth(),
         colors = ButtonDefaults.buttonColors(
             backgroundColor = Color(BLUE),
             contentColor = Color.White

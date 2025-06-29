@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.TextUnitType
 import androidx.compose.ui.unit.dp
@@ -29,8 +30,11 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import contentScale.ContentScale
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kottieComposition.KottieCompositionSpec
+import kottieComposition.animateKottieCompositionAsState
+import kottieComposition.rememberKottieComposition
 import model.UiElement
 import ui.component.AlphaButton
 import ui.component.AlphaInputText
@@ -41,9 +45,12 @@ import util.OllamaClient
 import util.PromptBuilder
 import util.TargetMapper
 import util.extractCodeBetweenMarkers
+import utils.KottieConstants
 import yaml.TestFlow
 import yaml.YamlFlowLoader
+import java.awt.Desktop
 import java.io.File
+import java.io.FileOutputStream
 
 @Preview
 @Composable
@@ -70,12 +77,34 @@ fun AppUI() {
     var platformClassOutput by remember { mutableStateOf("") }
     var stepDefinitionsOutput by remember { mutableStateOf("") }
     var featureFileOutput by remember { mutableStateOf("") }
-
+    var animation by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
-    val inputStream = {}.javaClass.getResourceAsStream("/drawable/robot_animation.json")
-        ?: throw IllegalArgumentException("Resource not found")
-    val json = inputStream.bufferedReader().use { it.readText() }
+    var parsingUiDump by remember { mutableStateOf(false) }
+
+    var playing by remember { mutableStateOf(true) }
+
+    LaunchedEffect(Unit) {
+        animation = ({}.javaClass.getResourceAsStream("/drawable/robot_animation.json")
+            ?: throw IllegalArgumentException("Resource not found")).bufferedReader().use { it.readText() }
+    }
+
+    val composition = rememberKottieComposition(
+        spec = KottieCompositionSpec.File(animation) // Or KottieCompositionSpec.Url || KottieCompositionSpec.JsonString
+    )
+
+    val animationState by animateKottieCompositionAsState(
+        composition = composition,
+        isPlaying = playing,
+        iterations = KottieConstants.IterateForever
+    )
+
+    LaunchedEffect(key1 = "1") {
+        scope.launch(Dispatchers.IO) {
+            delay(4000L)
+            playing = false
+        }
+    }
 
     Row(modifier = Modifier.fillMaxSize()) {
 
@@ -93,7 +122,7 @@ fun AppUI() {
                 Row(modifier = Modifier, verticalAlignment = Alignment.CenterVertically) {
                     Image(
                         modifier = Modifier.size(64.dp),
-                        painter = painterResource("drawable/logo.png"),
+                        painter = painterResource("drawable/app_icon.png"),
                         contentDescription = null,
                         colorFilter = ColorFilter.tint(Color.White)
                     )
@@ -190,7 +219,7 @@ fun AppUI() {
                 CaptureUiDump(isCaptureDone = isCapturedDone, onClick = {
                     isCapturedDone = false
                     scope.launch(Dispatchers.IO) {
-
+                        playing = true
                         // ✅ Parse YAML here to initialize parsedFlow
                         if (yamlContent.isNotBlank()) {
                             try {
@@ -226,6 +255,7 @@ fun AppUI() {
                         uiElements = parsed
                         println("UI Dump (updated): \n$uiElements")
                         isCapturedDone = true
+                        playing = false
                     }
                 }, onPackageNameChange = {
                     packageName = it
@@ -240,6 +270,7 @@ fun AppUI() {
 
             AlphaButton(isLoading = isLoading, text = "Generate with AI", onClick = {
                 showAnimation = true
+                playing = true
 
                 if (yamlContent.isBlank()) {
                     baseClassOutput = "Please enter YAML flow first."
@@ -282,6 +313,7 @@ fun AppUI() {
                                 }
                             },
                             onComplete = {
+                                playing = false
                                 showAnimation = false
                                 isLoading = false
                                 val outputText = fullOutput.toString()
@@ -303,6 +335,9 @@ fun AppUI() {
             })
         }
 
+        // Divider
+        VerticalDivider(modifier = Modifier.padding(vertical = 24.dp), color = Color(0xffe3e3e3))
+
         // Right Pane
         Column(
             modifier = Modifier
@@ -310,15 +345,44 @@ fun AppUI() {
                 .padding(16.dp)
         ) {
             if (showAnimation) {
-                KottieAnimation(
-                    composition = KottieCompositionSpec.JsonString(json),
-                    modifier = Modifier.size(200.dp),
-                    progress = {
-                        50f
-                    },
-                    backgroundColor = Color.Transparent,
-                    contentScale = ContentScale.Fit
-                )
+                Row(
+                    modifier = Modifier.fillMaxSize(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        KottieAnimation(
+                            composition = composition,
+                            modifier = Modifier.size(300.dp),
+                            progress = {
+                                animationState.progress
+                            },
+                            backgroundColor = Color.Transparent,
+                            contentScale = ContentScale.Fit
+                        )
+                        Spacer(modifier = Modifier.size(26.dp))
+                        Text(
+                            text = if (isLoading) "Please wait" else "Welcome to Alpha AI Automation",
+                            fontWeight = MaterialTheme.typography.h6.fontWeight,
+                            fontSize = TextUnit(22f, TextUnitType.Sp)
+                        )
+                        Spacer(modifier = Modifier.size(4.dp))
+                        Text(
+                            text = if (isLoading) "Generating response..." else  "Generate BaseClass, Platform, StepsDefs, Feature file with AI",
+                            fontWeight = MaterialTheme.typography.h1.fontWeight,
+                            fontSize = TextUnit(14f, TextUnitType.Sp)
+                        )
+                        Spacer(modifier = Modifier.size(16.dp))
+                        AnimatedVisibility(isLoading.not()) {
+                            AlphaButton(
+                                modifier = Modifier.fillMaxWidth(fraction = 0.3f),
+                                text = "Need help, read documentation"
+                            ) {
+                                openPdfFromResources("files/documentation.pdf")
+                            }
+                        }
+                    }
+                }
             } else {
                 AlphaTabRow(
                     tabs = tabTitles,
@@ -516,16 +580,42 @@ fun FlowInput(hint: String, onTextChange: (String) -> Unit) {
     )
 }
 
-fun loadAnimationFromResources(path: String): File {
-    val inputStream = {}.javaClass.getResourceAsStream(path)
-        ?: throw IllegalArgumentException("Resource not found: $path")
-    val tempFile = kotlin.io.path.createTempFile(suffix = ".json").toFile()
-    inputStream.use { input ->
-        tempFile.outputStream().use { output ->
-            input.copyTo(output)
+
+@Composable
+fun VerticalDivider(
+    modifier: Modifier = Modifier,
+    color: Color = Color.LightGray,
+    thickness: Dp = 1.dp,
+    height: Dp = Dp.Unspecified, // Use fillMaxHeight if unspecified
+) {
+    Box(
+        modifier = modifier
+            .width(thickness)
+            .then(
+                if (height == Dp.Unspecified) Modifier.fillMaxHeight()
+                else Modifier.height(height)
+            )
+            .background(color)
+    )
+}
+
+fun openPdfFromResources(resourcePath: String) {
+    val inputStream = object {}.javaClass.classLoader.getResourceAsStream(resourcePath)
+    if (inputStream != null) {
+        // Create a temp file
+        val tempFile = File.createTempFile("documentation", ".pdf")
+        tempFile.deleteOnExit()
+
+        // Write resource to temp file
+        FileOutputStream(tempFile).use { output ->
+            inputStream.copyTo(output)
         }
+
+        // Open the PDF using default viewer
+        Desktop.getDesktop().open(tempFile)
+    } else {
+        println("❌ PDF resource not found at $resourcePath")
     }
-    return tempFile
 }
 
 

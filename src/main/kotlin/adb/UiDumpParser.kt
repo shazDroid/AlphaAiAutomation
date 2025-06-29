@@ -11,13 +11,30 @@ import javax.xml.parsers.DocumentBuilderFactory
 
 object UiDumpParser {
 
+
     fun getUiDumpXml(deviceId: String): String {
+        val userHome = System.getProperty("user.home")
+        val dumpFile = File(userHome, "uidump.xml")
+
+        // Dump UI to device
         AdbExecutor.runCommand("adb -s $deviceId shell uiautomator dump /sdcard/uidump.xml")
-        AdbExecutor.runCommand("adb -s $deviceId pull /sdcard/uidump.xml ./uidump.xml")
-        val xmlContent = File("./uidump.xml").readText()
-        File("./uidump.xml").delete()
+
+        // Pull dump to absolute path
+        AdbExecutor.runCommand("adb -s $deviceId pull /sdcard/uidump.xml ${dumpFile.absolutePath}")
+
+        // Read content
+        val xmlContent = if (dumpFile.exists()) {
+            dumpFile.readText()
+        } else {
+            throw RuntimeException("❌ Failed to pull UI dump from device")
+        }
+
+        // Delete pulled file
+        dumpFile.delete()
+
         return xmlContent
     }
+
 
     fun cleanUiDumpXml(rawXml: String): String {
         val endIndex = rawXml.indexOf("</hierarchy>") + "</hierarchy>".length

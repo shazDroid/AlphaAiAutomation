@@ -13,4 +13,4 @@ pluginManagement {
     }
 }
 
-rootProject.name = "AIAutomation"
+rootProject.name = "Alpha AI Automation"

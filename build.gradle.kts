@@ -38,6 +38,18 @@ compose.desktop {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "AIAutomation"
             packageVersion = "1.0.0"
+
+            macOS {
+                iconFile.set(project.file("src/main/resources/drawable/app_icon.png"))
+            }
+
+            windows {
+                iconFile.set(project.file("src/main/resources/drawable/app_icon.png"))
+            }
+
+            linux {
+                iconFile.set(project.file("src/main/resources/drawable/app_icon.png"))
+            }
         }
     }
 }
