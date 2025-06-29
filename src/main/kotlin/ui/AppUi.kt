@@ -65,7 +65,7 @@ fun AppUI() {
 
     // Tab states
     var selectedTab by remember { mutableStateOf(0) }
-    val tabTitles = listOf("Base Class", "Platform class", "Step Definitions", "Feature File")
+    val tabTitles = listOf("UI Dump", "Base Class", "Platform class", "Step Definitions", "Feature File")
     var baseClassOutput by remember { mutableStateOf("") }
     var platformClassOutput by remember { mutableStateOf("") }
     var stepDefinitionsOutput by remember { mutableStateOf("") }
@@ -290,10 +290,11 @@ fun AppUI() {
                 )
 
                 when (selectedTab) {
-                    0 -> CodeBlock(baseClassOutput, "typescript")
-                    1 -> CodeBlock(platformClassOutput, "typescript")
-                    2 -> CodeBlock(stepDefinitionsOutput, "typescript")
-                    3 -> CodeBlock(featureFileOutput, "gherkin")
+                    0 -> CodeBlock(uiElements.toString(), "plain")
+                    1 -> CodeBlock(baseClassOutput, "typescript")
+                    2 -> CodeBlock(platformClassOutput, "typescript")
+                    3 -> CodeBlock(stepDefinitionsOutput, "typescript")
+                    4 -> CodeBlock(featureFileOutput, "gherkin")
                 }
             }
         }
