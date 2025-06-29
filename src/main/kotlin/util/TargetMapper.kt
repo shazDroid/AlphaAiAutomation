@@ -26,27 +26,35 @@ object TargetMapper {
                     }
 
                     if (label != null) {
-                        // Step 2: Try to find nearest EditText below this label in UI dump order
                         val labelIndex = uiElements.indexOf(label)
+
+                        // Step 2: Find nearest EditText below this label in UI dump order
                         val editTextBelow = uiElements.subList(labelIndex, uiElements.size)
                             .find { it.clazz.endsWith("EditText") }
 
                         if (editTextBelow != null) {
-                            val effectiveTarget = if (editTextBelow.resourceId.isNotBlank()) {
-                                editTextBelow.resourceId
-                            } else {
-                                "//${editTextBelow.clazz}[@bounds=\"${editTextBelow.bounds}\"]"
+                            val effectiveTarget = when {
+                                editTextBelow.resourceId.isNotBlank() -> {
+                                    // Use resource-id directly
+                                    editTextBelow.resourceId
+                                }
+                                else -> {
+                                    // Use sibling XPath referencing the label
+                                    "//${label.clazz}[@text=\"${label.text}\"]/following::${editTextBelow.clazz}[1]"
+                                }
                             }
 
                             action.target = effectiveTarget
                             editTextBelow.effectiveTarget = effectiveTarget
 
                             actionableElements.add(editTextBelow)
+
+                            println("✅ Mapped '${action.target_text}' to EditText with effective target: $effectiveTarget")
                         } else {
-                            println("No EditText found below label ${action.target_text}")
+                            println("❌ No EditText found below label ${action.target_text}")
                         }
                     } else {
-                        println("No TextView label found for ${action.target_text}")
+                        println("❌ No TextView label found for ${action.target_text}")
                     }
                 }
 
@@ -67,13 +75,12 @@ object TargetMapper {
                         clickable.effectiveTarget = effectiveTarget
 
                         actionableElements.add(clickable)
-                        println("Mapped click action '${action.target_text}' to ${clickable.clazz}")
                     } else {
-                        println("No clickable element found for ${action.target_text}")
+                        println("❌ No clickable element found for ${action.target_text}")
                     }
                 }
 
-                else -> println("Skipped unknown action ${action.action}")
+                else -> println("⚠️ Skipped unknown action ${action.action}")
             }
         }
 

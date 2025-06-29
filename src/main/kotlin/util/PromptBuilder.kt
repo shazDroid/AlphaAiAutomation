@@ -28,11 +28,11 @@ object PromptBuilder {
 
         // Filter actionable UI elements only if they are in YAML targets
         val actionableElements = uiElements.filter { element ->
-            val resourceMatch = element.resourceId in yamlTargetIds
-            val effectiveTargetMatch = element.effectiveTarget in yamlEffectiveTargets
+            val resourceMatch = element.resourceId in yamlTargetIds || element.effectiveTarget in yamlTargetIds
             val textMatch = element.text.lowercase() in yamlTargetTexts
-            resourceMatch || effectiveTargetMatch || textMatch
+            resourceMatch || textMatch
         }
+
 
 
         builder.append("Here are the actionable extracted UI elements with aliases for page object getters:\n")
