@@ -1,9 +1,15 @@
 package util
 
+import agent.ActionPlan
+import agent.Snapshot
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import model.UiElement
+import org.openqa.selenium.json.Json
 import yaml.TestFlow
 
 object PromptBuilder {
+    private val mapper = jacksonObjectMapper().registerKotlinModule()
     fun buildPrompt(featureFlowName: String, flow: TestFlow, uiElements: List<UiElement>): String {
         val builder = StringBuilder()
 
@@ -117,4 +123,69 @@ object PromptBuilder {
         val textPart = element.text.takeIf { it.isNotBlank() }?.replace("\\s+".toRegex(), "_") ?: ""
         return (idPart + textPart).decapitalize()
     }
+
+    fun buildActionSummaryJson(plan: ActionPlan, timeline: List<Snapshot>): String {
+        val executed = timeline.map {
+            mapOf(
+                "index" to it.stepIndex,
+                "type" to it.action.name,
+                "targetHint" to (it.targetHint ?: ""),
+                "success" to it.success,
+                "locator" to (it.resolvedLocator?.let { l ->
+                    mapOf("strategy" to l.strategy.name, "value" to l.value)
+                })
+            )
+        }
+
+        val steps = plan.steps.map { s ->
+            mapOf(
+                "index" to s.index,
+                "type" to s.type.name,
+                "targetHint" to (s.targetHint ?: ""),
+                "value" to (s.value ?: "")
+            )
+        }
+
+        val root = mapOf(
+            "title" to plan.title,
+            "steps" to steps,
+            "executed" to executed
+        )
+
+        return mapper.writeValueAsString(root)
+    }
+
+    fun buildWdioCucumberPrompt(summaryJson: String, uiHintsJson: String): String = """
+        SUMMARY_JSON:
+        $summaryJson
+
+        UI_HINTS_JSON:
+        $uiHintsJson
+
+        Generate four files:
+        1) BasePage.ts
+           - Only abstract getters:
+             public abstract get <camelCaseName>(): ChainablePromise<WebdriverIO.Element>;
+        2) PlatformPage.ts
+           - Extends BasePage; implement getters with stable selectors
+             (resource-id > content-desc > UiSelector().textContains > XPath).
+        3) StepDefinitions.ts
+           - Use getters only; no raw selectors.
+        4) feature.feature
+           - One scenario based on SUMMARY_JSON.title; describe the business flow.
+
+        Return each file in a fenced block named with the file:
+        ```BasePage.ts
+        ...
+        ```
+        ```PlatformPage.ts
+        ...
+        ```
+        ```StepDefinitions.ts
+        ...
+        ```
+        ```feature.feature
+        ...
+        ```
+    """.trimIndent()
 }

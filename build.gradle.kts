@@ -4,6 +4,7 @@ plugins {
     kotlin("jvm")
     id("org.jetbrains.compose")
     id("org.jetbrains.kotlin.plugin.compose")
+    kotlin("plugin.serialization") version "2.0.0"
 }
 
 group = "com.shazdroid.aiautomation"
@@ -28,6 +29,18 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.github.ismai117:kottie:1.9.6")
 
+    // Appium
+    implementation("io.appium:java-client:9.2.3")
+    implementation("org.seleniumhq.selenium:selenium-java:4.23.0")
+
+
+    // XML parsing
+    implementation("org.jsoup:jsoup:1.18.1")
+
+    // Coroutines
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.1")
 }
 
 compose.desktop {

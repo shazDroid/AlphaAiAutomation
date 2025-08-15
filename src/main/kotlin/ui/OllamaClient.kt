@@ -1,10 +1,13 @@
-package util
+package ui
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.kotlin.jsonMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 object OllamaClient {
@@ -52,6 +55,47 @@ object OllamaClient {
                 onComplete()
             }
         })
+    }
+
+
+    fun completeBlocking(prompt: String): String {
+        val latch = CountDownLatch(1)
+        val out = StringBuilder()
+        sendPromptStreaming(
+            prompt = prompt,
+            onChunk = { chunk -> out.append(chunk) },
+            onComplete = { latch.countDown() }
+        )
+        latch.await()
+        return out.toString().trim()
+    }
+
+
+    fun completeJsonBlocking(system: String, user: String): String {
+        val mediaType = "application/json; charset=utf-8".toMediaType()
+        val payload = mapOf(
+            "model" to "deepseek-coder:6.7b",
+            "messages" to listOf(
+                mapOf("role" to "system", "content" to system),
+                mapOf("role" to "user", "content" to user)
+            ),
+            "stream" to false,
+            "temperature" to 0.0,
+            "format" to "json"
+        )
+        val body = mapper.writeValueAsString(payload).toRequestBody(mediaType)
+
+        val request = Request.Builder()
+            .url("http://localhost:11434/api/chat")
+            .post(body)
+            .build()
+
+        client.newCall(request).execute().use { resp ->
+            val raw = resp.body?.string().orEmpty().trim()
+            val node = mapper.readTree(raw)
+            val content = node.path("message").path("content").asText("")
+            return content.ifBlank { raw }
+        }
     }
 
 }

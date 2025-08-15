@@ -5,6 +5,12 @@ import KottieAnimation
 import adb.AdbExecutor
 import adb.UiDumpParser
 import adb.UiDumpParser.cleanUiDumpXml
+import agent.ActionPlan
+import agent.AgentRunner
+import agent.IntentParser
+import agent.LocatorResolver
+import agent.Snapshot
+import agent.SnapshotStore
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.desktop.ui.tooling.preview.Preview
 import androidx.compose.foundation.*
@@ -19,6 +25,8 @@ import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
 import androidx.compose.ui.res.painterResource
@@ -26,9 +34,11 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.TextUnitType
 import androidx.compose.ui.unit.dp
+import appium.DriverFactory
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import contentScale.ContentScale
+import generator.LlmScriptGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -41,7 +51,6 @@ import ui.component.AlphaInputText
 import ui.component.AlphaInputTextMultiline
 import ui.component.AlphaTabRow
 import ui.theme.BLUE
-import util.OllamaClient
 import util.PromptBuilder
 import util.TargetMapper
 import util.extractCodeBetweenMarkers
@@ -58,7 +67,7 @@ fun AppUI() {
     val mapper = ObjectMapper().registerKotlinModule()
     var devices by remember { mutableStateOf(listOf<String>()) }
     var selectedDevice by remember { mutableStateOf("") }
-    var packageName by remember { mutableStateOf("com.shazdroid.messapp") }
+    var packageName by remember { mutableStateOf("com.ksaemiratesnbd.android.uat") }
     var uiElements by remember { mutableStateOf(listOf<UiElement>()) }
     var showAnimation by remember { mutableStateOf(true) }
 
@@ -83,6 +92,27 @@ fun AppUI() {
     var parsingUiDump by remember { mutableStateOf(false) }
 
     var playing by remember { mutableStateOf(true) }
+
+    var agentTimeline by remember { mutableStateOf<List<Snapshot>>(emptyList()) }
+    val agentLogs = remember { mutableStateListOf<String>() }
+    var agentStatus by remember { mutableStateOf<String?>(null) }
+    var agentTotalSteps by remember { mutableStateOf(0) }
+    var agentCompletedSteps by remember { mutableStateOf(0) }
+    var isAgentRunning by remember { mutableStateOf(false) }
+    var showAgentView by remember { mutableStateOf(false) }
+
+    // live screen
+    var agentImage by remember { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(isAgentRunning, selectedDevice) {
+        while (isAgentRunning && selectedDevice.isNotBlank()) {
+            AdbExecutor.screencapPng(selectedDevice)?.let { bytes ->
+                val img = org.jetbrains.skia.Image.makeFromEncoded(bytes).asImageBitmap()
+                agentImage = img
+            }
+            delay(700)
+        }
+    }
+
 
     LaunchedEffect(Unit) {
         animation = ({}.javaClass.getResourceAsStream("/drawable/robot_animation.json")
@@ -268,6 +298,30 @@ fun AppUI() {
 
             Spacer(modifier = Modifier.height(16.dp))
 
+            AgentComponent(
+                selectedDevice = selectedDevice,
+                packageName = packageName,
+                onShowAgentView = { showAgentView = true; showAnimation = false },
+                onStatus = { s -> agentStatus = s },
+                onLog = { line ->
+                    val ts = java.time.LocalTime.now().toString().substring(0, 8)
+                    agentLogs.add(0, "[$ts] $line")
+                    if (agentLogs.size > 400) agentLogs.removeLast()
+                },
+                onTimelineUpdate = { list ->
+                    agentTimeline = list
+                    agentCompletedSteps = list.size
+                },
+                onRunState = { running, total ->
+                    isAgentRunning = running
+                    agentTotalSteps = total
+                    if (running) showAgentView = true
+                }
+            )
+
+
+            Spacer(modifier = Modifier.height(16.dp))
+
             AlphaButton(isLoading = isLoading, text = "Generate with AI", onClick = {
                 showAnimation = true
                 playing = true
@@ -339,63 +393,149 @@ fun AppUI() {
         VerticalDivider(modifier = Modifier.padding(vertical = 24.dp), color = Color(0xffe3e3e3))
 
         // Right Pane
+
         Column(
-            modifier = Modifier
-                .weight(0.6f)
-                .padding(16.dp)
+            modifier = Modifier.weight(0.6f).padding(16.dp)
         ) {
-            if (showAnimation) {
-                Row(
-                    modifier = Modifier.fillMaxSize(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        KottieAnimation(
-                            composition = composition,
-                            modifier = Modifier.size(300.dp),
-                            progress = {
-                                animationState.progress
-                            },
-                            backgroundColor = Color.Transparent,
-                            contentScale = ContentScale.Fit
-                        )
-                        Spacer(modifier = Modifier.size(26.dp))
-                        Text(
-                            text = if (isLoading) "Please wait" else "Welcome to Alpha AI Automation",
-                            fontWeight = MaterialTheme.typography.h6.fontWeight,
-                            fontSize = TextUnit(22f, TextUnitType.Sp)
-                        )
-                        Spacer(modifier = Modifier.size(4.dp))
-                        Text(
-                            text = if (isLoading) "Generating response..." else  "Generate BaseClass, Platform, StepsDefs, Feature file with AI",
-                            fontWeight = MaterialTheme.typography.h1.fontWeight,
-                            fontSize = TextUnit(14f, TextUnitType.Sp)
-                        )
-                        Spacer(modifier = Modifier.size(16.dp))
-                        AnimatedVisibility(isLoading.not()) {
-                            AlphaButton(
-                                modifier = Modifier.fillMaxWidth(fraction = 0.3f),
-                                text = "Need help, read documentation"
-                            ) {
-                                openPdfFromResources("files/documentation.pdf")
+            val showAgent = showAgentView || isAgentRunning || agentTimeline.isNotEmpty()
+
+            if (!showAgent) {
+                if (showAnimation) {
+                    Row(
+                        modifier = Modifier.fillMaxSize(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            KottieAnimation(
+                                composition = composition,
+                                modifier = Modifier.size(300.dp),
+                                progress = {
+                                    animationState.progress
+                                },
+                                backgroundColor = Color.Transparent,
+                                contentScale = ContentScale.Fit
+                            )
+                            Spacer(modifier = Modifier.size(26.dp))
+                            Text(
+                                text = if (isLoading) "Please wait" else "Welcome to Alpha AI Automation",
+                                fontWeight = MaterialTheme.typography.h6.fontWeight,
+                                fontSize = TextUnit(22f, TextUnitType.Sp)
+                            )
+                            Spacer(modifier = Modifier.size(4.dp))
+                            Text(
+                                text = if (isLoading) "Generating response..." else "Generate BaseClass, Platform, StepsDefs, Feature file with AI",
+                                fontWeight = MaterialTheme.typography.h1.fontWeight,
+                                fontSize = TextUnit(14f, TextUnitType.Sp)
+                            )
+                            Spacer(modifier = Modifier.size(16.dp))
+                            AnimatedVisibility(isLoading.not()) {
+                                AlphaButton(
+                                    modifier = Modifier.fillMaxWidth(fraction = 0.3f),
+                                    text = "Need help, read documentation"
+                                ) {
+                                    openPdfFromResources("files/documentation.pdf")
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    AlphaTabRow(
+                        tabs = tabTitles,
+                        selectedTabIndex = selectedTab,
+                        onTabSelected = { selectedTab = it }
+                    )
+                    when (selectedTab) {
+                        0 -> CodeBlock(uiElements.toString(), "plain")
+                        1 -> CodeBlock(baseClassOutput, "typescript")
+                        2 -> CodeBlock(platformClassOutput, "typescript")
+                        3 -> CodeBlock(stepDefinitionsOutput, "typescript")
+                        4 -> CodeBlock(featureFileOutput, "gherkin")
+                    }
+                }
+            } else {
+                // ==== AGENT VIEW ====
+                Text("Agent run", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                Spacer(Modifier.height(8.dp))
+
+                // top row: live device + progress
+                Row(Modifier.fillMaxWidth()) {
+                    Box(
+                        modifier = Modifier.weight(0.55f)
+                            .height(360.dp)
+                            .background(Color(0xFFF8F8F8), RoundedCornerShape(12.dp))
+                            .border(1.dp, Color(0xFFE3E3E3), RoundedCornerShape(12.dp))
+                            .padding(8.dp)
+                    ) {
+                        if (agentImage != null) {
+                            Image(
+                                bitmap = agentImage!!,
+                                contentDescription = null,
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                            )
+                        } else {
+                            Text("Live screen will appear here…", color = Color.Gray)
+                        }
+                    }
+
+                    Spacer(Modifier.width(12.dp))
+
+                    Column(Modifier.weight(0.45f)) {
+                        val progress = if (agentTotalSteps > 0) agentCompletedSteps.toFloat() / agentTotalSteps else 0f
+                        LinearProgressIndicator(progress = progress, modifier = Modifier.fillMaxWidth())
+                        Spacer(Modifier.height(8.dp))
+                        Text("Progress: $agentCompletedSteps / $agentTotalSteps")
+                        Spacer(Modifier.height(4.dp))
+                        Text(agentStatus ?: "", color = Color.Gray)
+                        Spacer(Modifier.height(12.dp))
+
+                        Text("Timeline", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                        Spacer(Modifier.height(6.dp))
+                        Box(
+                            Modifier.fillMaxWidth().height(180.dp)
+                                .background(Color.White, RoundedCornerShape(8.dp))
+                                .border(1.dp, Color(0xFFE3E3E3), RoundedCornerShape(8.dp))
+                                .padding(8.dp)
+                        ) {
+                            if (agentTimeline.isEmpty()) {
+                                Text("Waiting for steps…", color = Color.Gray)
+                            } else {
+                                LazyColumn {
+                                    items(agentTimeline) { snap ->
+                                        val ok = if (snap.success) "✅" else "❌"
+                                        Text("$ok #${snap.stepIndex} ${snap.action} ${snap.targetHint ?: ""}")
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            } else {
-                AlphaTabRow(
-                    tabs = tabTitles,
-                    selectedTabIndex = selectedTab,
-                    onTabSelected = { selectedTab = it }
-                )
 
-                when (selectedTab) {
-                    0 -> CodeBlock(uiElements.toString(), "plain")
-                    1 -> CodeBlock(baseClassOutput, "typescript")
-                    2 -> CodeBlock(platformClassOutput, "typescript")
-                    3 -> CodeBlock(stepDefinitionsOutput, "typescript")
-                    4 -> CodeBlock(featureFileOutput, "gherkin")
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Agent logs", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                    Spacer(Modifier.weight(1f))
+                    AlphaButton(text = "Clear logs", modifier = Modifier.width(120.dp)) {
+                        agentLogs.clear()        // ← wipes the live log list
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                Box(
+                    Modifier.fillMaxWidth().height(180.dp)
+                        .background(Color.White, RoundedCornerShape(8.dp))
+                        .border(1.dp, Color(0xFFE3E3E3), RoundedCornerShape(8.dp))
+                        .padding(8.dp)
+                ) {
+                    if (agentLogs.isEmpty()) {
+                        Text("Logs will appear here…", color = Color.Gray)
+                    } else {
+                        LazyColumn {
+                            items(agentLogs) { line ->
+                                Text(line, fontSize = TextUnit(12f, TextUnitType.Sp))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -617,5 +757,143 @@ fun openPdfFromResources(resourcePath: String) {
         println("❌ PDF resource not found at $resourcePath")
     }
 }
+
+@Composable
+fun AgentComponent(
+    selectedDevice: String,
+    packageName: String,
+    onShowAgentView: () -> Unit,
+    onStatus: (String) -> Unit,
+    onLog: (String) -> Unit,
+    onTimelineUpdate: (List<Snapshot>) -> Unit,
+    onRunState: (running: Boolean, totalSteps: Int) -> Unit
+) {
+    val scope = rememberCoroutineScope()
+    var nlTask by remember { mutableStateOf("") }
+    var appActivity by remember { mutableStateOf("com.emiratesnbd.uat.MainActivity") }
+    var plan by remember { mutableStateOf<ActionPlan?>(null) }
+    var timeline by remember { mutableStateOf<List<Snapshot>>(emptyList()) }
+    var outputDir by remember { mutableStateOf("automation-output") }
+    var isParsing by remember { mutableStateOf(false) }
+    var isGenerating by remember { mutableStateOf(false) }
+
+    val intentParser = remember { IntentParser() }
+
+    Box(
+        modifier = Modifier.fillMaxWidth()
+            .background(Color(0xFFEDF3FF), RoundedCornerShape(12.dp))
+            .padding(12.dp)
+    ) {
+        Column {
+            Text("Agent (Natural Language)", fontWeight = MaterialTheme.typography.h6.fontWeight)
+            Spacer(Modifier.height(8.dp))
+
+            AlphaInputText(value = packageName, onValueChange = {}, hint = "App package")
+            Spacer(Modifier.height(8.dp))
+            AlphaInputText(value = appActivity, onValueChange = { appActivity = it }, hint = "Main activity")
+
+            Spacer(Modifier.height(12.dp))
+            AlphaInputTextMultiline(
+                value = nlTask,
+                onValueChange = { nlTask = it },
+                hint = "Describe the task…",
+                backgroundColor = Color.White
+            )
+
+            Spacer(Modifier.height(12.dp))
+
+            Row {
+                AlphaButton(text = "Parse Task", isLoading = isParsing, onClick = {
+                    if (nlTask.isBlank()) {
+                        onStatus("Please enter a task."); return@AlphaButton
+                    }
+                    onShowAgentView()
+                    isParsing = true; onStatus("Parsing task…")
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val p = intentParser.parse(nlTask)
+                            // normalize indices
+                            val fixed = p.copy(steps = p.steps.mapIndexed { i, s -> s.copy(index = i + 1) })
+                            plan = fixed
+                            onStatus("Parsed ${fixed.steps.size} steps.")
+                            onLog("Parsed plan: ${fixed.steps.joinToString { "${it.index}:${it.type}" }}")
+                        } catch (e: Exception) {
+                            onStatus("Parse error: ${e.message}")
+                            onLog("Parse error: ${e}")
+                        } finally {
+                            isParsing = false
+                        }
+                    }
+                })
+            }
+            Spacer(Modifier.height(8.dp))
+            Row {
+                AlphaButton(text = "Run agent", onClick = {
+                    if (selectedDevice.isBlank()) { onStatus("Select a device first."); onLog("Preflight: no device"); return@AlphaButton }
+                    if (!util.AppiumHealth.isReachable()) { onStatus("❌ Appium not reachable at 127.0.0.1:4723"); onLog("Preflight: appium down"); return@AlphaButton }
+                    if (!adb.AdbExecutor.isPackageInstalled(selectedDevice, packageName)) { onStatus("❌ Package $packageName not installed"); onLog("Preflight: package missing"); return@AlphaButton }
+
+                    onShowAgentView()
+                    val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
+                    onRunState(true, p.steps.size)
+                    onStatus("Starting driver/session…")
+                    timeline = emptyList(); onTimelineUpdate(timeline)
+
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val driver = appium.DriverFactory.startAndroid(
+                                udid = selectedDevice,
+                                appPackage = packageName,
+                                appActivity = appActivity
+                            )
+                            val resolver = agent.LocatorResolver(driver) { msg -> onLog(msg) }
+                            val store = agent.SnapshotStore(driver, java.io.File("runs/${System.currentTimeMillis()}"))
+
+                            val result = agent.AgentRunner(driver, resolver, store).run(
+                                plan = p,
+                                onStep = { snap ->
+                                    timeline = timeline + snap
+                                    onTimelineUpdate(timeline)
+                                    onLog("Step ${snap.stepIndex} ${snap.action} -> ${if (snap.success) "OK" else "FAIL"}")
+                                    onLog("  xml: ${snap.pageSourcePath}")
+                                    onLog("  png: ${snap.screenshotPath}")
+                                }
+                                ,
+                                onLog = onLog,
+                                onStatus = onStatus
+                            )
+
+                            onStatus("Done: ${result.count { it.success }}/${result.size} steps OK")
+                            driver.quit()
+                        } catch (e: Exception) {
+                            onStatus("❌ Agent error: ${e.message}")
+                            onLog("Agent error: $e")
+                        } finally {
+                            onRunState(false, p.steps.size)
+                        }
+                    }
+                })
+
+                Spacer(Modifier.width(8.dp))
+
+                AlphaButton(text = "Generate with AI", onClick = {
+                    val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
+                    if (timeline.isEmpty()) { onStatus("Run the agent first."); return@AlphaButton }
+                    onShowAgentView(); onStatus("Generating scripts with AI…")
+                    scope.launch(Dispatchers.IO) {
+                        try { generator.LlmScriptGenerator(OllamaClient, java.io.File(outputDir)).generate(p, timeline)
+                            onStatus("Scripts written to $outputDir") }
+                        catch (e: Exception) { onStatus("Generation error: ${e.message}"); onLog("Generation error: $e") }
+                    }
+                })
+            }
+
+            Spacer(Modifier.height(8.dp))
+            AlphaInputText(value = outputDir, onValueChange = { outputDir = it }, hint = "Output folder")
+        }
+    }
+}
+
+
 
 
