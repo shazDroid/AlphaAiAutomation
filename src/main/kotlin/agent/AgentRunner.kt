@@ -18,14 +18,22 @@ class AgentRunner(
     ): List<Snapshot> {
         val out = mutableListOf<Snapshot>()
         onLog("Plan started: \"${plan.title}\" (${plan.steps.size} steps)")
+        var pc = 0
+        val steps = plan.steps
 
-        for (step in plan.steps) {
-            onStatus("Step ${step.index}/${plan.steps.size}: ${step.type} ${step.targetHint ?: ""}")
+        while (pc in steps.indices) {
+            val step = steps[pc]
+            onStatus("Step ${step.index}/${steps.size}: ${step.type} ${step.targetHint ?: ""}")
             onLog("➡️  ${step.index} ${step.type} target='${step.targetHint}' value='${step.value}'")
-
             var ok = true
             var chosen: Locator? = null
             var notes: String? = null
+
+            fun jumpToLabelOrThrow(name: String): Int {
+                val idx = steps.indexOfFirst { it.type == StepType.LABEL && it.targetHint == name }
+                require(idx >= 0) { "GOTO/IF target label not found: $name" }
+                return idx
+            }
 
             try {
                 when (step.type) {
@@ -123,10 +131,34 @@ class AgentRunner(
                         resolver.scrollToText(th)
                         onLog("✓ scrolled")
 
-                        runCatching {
-                            val loc = resolver.waitForElementPresent(th, timeoutMs = 4000, clickIfFound = true) { msg -> onLog("  $msg") }
-                            onLog("✓ (optional) tapped \"$th\" after scroll via ${loc.strategy}")
-                        }.onFailure { onLog("  (optional) tap after scroll skipped: ${it.message}") }
+//                        runCatching {
+//                            val loc = resolver.waitForElementPresent(th, timeoutMs = 4000, clickIfFound = true) { msg -> onLog("  $msg") }
+//                            onLog("✓ (optional) tapped \"$th\" after scroll via ${loc.strategy}")
+//                        }.onFailure { onLog("  (optional) tap after scroll skipped: ${it.message}") }
+                    }
+
+                    StepType.CHECK -> {
+                        val nth = step.meta["nth"]?.toIntOrNull() ?: 1
+                        val th  = step.targetHint
+                        val desire = step.value?.trim()?.lowercase()
+
+                        onStatus("Checking ${th ?: "checkbox"} (nth=$nth${if (desire != null) ", set=$desire" else ""})")
+                        chosen = resolver.resolveCheckbox(th, nth) { msg -> onLog("  $msg") }
+
+                        val el = driver.findElement(chosen!!.toBy())
+                        val isChecked = (runCatching { el.getAttribute("checked") }.getOrNull() ?: "false") == "true"
+
+                        val want = when (desire) {
+                            "on","true","checked","tick","select" -> true
+                            "off","false","unchecked","untick","deselect" -> false
+                            else -> !isChecked
+                        }
+
+                        if (isChecked != want) {
+                            runCatching { el.click() }
+                                .onFailure { e -> throw IllegalStateException("CHECK toggle failed: ${e.message}", e) }
+                        }
+                        onLog("✓ checkbox state -> ${if (want) "ON" else "OFF"}")
                     }
 
                     StepType.SLIDE -> {
@@ -172,6 +204,33 @@ class AgentRunner(
                         Thread.sleep(ms)
                         onLog("✓ wake")
                     }
+
+                    StepType.LABEL -> {
+                        onLog("📍 label: ${step.targetHint}")
+                    }
+
+                    StepType.GOTO -> {
+                        val lbl = step.meta["label"] ?: step.targetHint ?: error("Missing label for GOTO")
+                        onLog("↩︎ goto '$lbl'")
+                        pc = jumpToLabelOrThrow(lbl)
+                        val snap = store.capture(step.index, step.type, step.targetHint, null, true, null)
+                        onStep(snap); out += snap
+                        continue
+                    }
+
+                    StepType.IF_VISIBLE -> {
+                        val q = step.targetHint ?: error("Missing query for IF_VISIBLE")
+                        val tLbl = step.meta["then"] ?: error("Missing meta.then for IF_VISIBLE")
+                        val fLbl = step.meta["else"] ?: error("Missing meta.else for IF_VISIBLE")
+                        val tout = step.meta["timeoutMs"]?.toLongOrNull() ?: 2500L
+                        onStatus("IF_VISIBLE \"$q\" ? then '$tLbl' : '$fLbl'")
+                        val hit = resolver.isPresentQuick(q, timeoutMs = tout) { msg -> onLog("  $msg") } != null
+                        onLog(if (hit) "✓ IF true → $tLbl" else "✓ IF false → $fLbl")
+                        pc = jumpToLabelOrThrow(if (hit) tLbl else fLbl)
+                        val snap = store.capture(step.index, step.type, step.targetHint, null, true, null)
+                        onStep(snap); out += snap
+                        continue
+                    }
                 }
             } catch (e: Exception) {
                 ok = false
@@ -184,6 +243,7 @@ class AgentRunner(
             out += snap
             onStep(snap)
             if (!ok) break
+            pc += 1
         }
 
         onLog("Plan completed. Success ${out.count { it.success }}/${out.size}")

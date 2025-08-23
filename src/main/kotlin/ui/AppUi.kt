@@ -811,8 +811,7 @@ fun AgentComponent(
                     isParsing = true; onStatus("Parsing task…")
                     scope.launch(Dispatchers.IO) {
                         try {
-                            val p = intentParser.parse(nlTask)
-                            // normalize indices
+                            val p = intentParser.parse(nlTask, packageName)
                             val fixed = p.copy(steps = p.steps.mapIndexed { i, s -> s.copy(index = i + 1) })
                             plan = fixed
                             onStatus("Parsed ${fixed.steps.size} steps.")

@@ -26,13 +26,32 @@ object InputEngine {
 
         resolver.waitForStableUi()
 
-        // Input-aware resolution (label → editable, id patterns, custom classes, etc.)
         val loc = resolver.resolveForInputAdvanced(targetHint) { msg -> log("  $msg") }
-        val el = driver.findElement(loc.toBy())
+        var el = driver.findElement(loc.toBy())
 
         // Focus
         runCatching { el.click() }.onFailure { log("  click() failed: ${it.message}") }
         Thread.sleep(120)
+
+        val focused = runCatching {
+            io.appium.java_client.AppiumBy.androidUIAutomator("new UiSelector().focused(true)")
+        }.mapCatching { by -> driver.findElement(by) }
+            .onSuccess { f ->
+                log("  using focused node: class=${f.getAttribute("className")}, id=${f.getAttribute("resource-id")}")
+            }.getOrNull()
+
+        if (focused != null) el = focused
+        else {
+            val desc = runCatching {
+                el.findElement(
+                    io.appium.java_client.AppiumBy.xpath(
+                        ".//*[contains(@class,'EditText') or contains(@class,'TextInputEditText') or contains(@class,'AutoCompleteTextView')]"
+                    )
+                )
+            }.onSuccess { d -> log("  using descendant editable: class=${d.getAttribute("className")}") }
+                .getOrNull()
+            if (desc != null) el = desc
+        }
 
         runCatching { el.clear() }.onFailure { log("  clear() failed (non-fatal): ${it.message}") }
 

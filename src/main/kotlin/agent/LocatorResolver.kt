@@ -395,4 +395,100 @@ class LocatorResolver(
         logger("ultimate fallback: //*[contains(@class,'EditText')][1]")
         return Locator(Strategy.XPATH, "(//*[contains(@class,'EditText')])[1]")
     }
+
+    fun isPresentQuick(
+        targetHint: String,
+        timeoutMs: Long = 2_500,
+        logger: (String) -> Unit = log
+    ): Locator? {
+        logger("isPresentQuick(\"$targetHint\", $timeoutMs ms)")
+        val end = System.currentTimeMillis() + timeoutMs
+        var lastErr: Throwable? = null
+        while (System.currentTimeMillis() < end) {
+            waitForStableUi()
+            runCatching {
+                val loc = resolve(targetHint, logger)
+                driver.findElement(loc.toBy())
+                logger("✓ present(quick) via ${loc.strategy} -> ${loc.value}")
+                return loc
+            }.onFailure { lastErr = it }
+            // one fast rebuild try
+            runCatching {
+                rebuildXPathFromDump(targetHint, logger)?.let { xp ->
+                    val loc = Locator(Strategy.XPATH, xp)
+                    driver.findElement(loc.toBy())
+                    logger("✓ present(quick) via rebuilt xpath")
+                    return loc
+                }
+            }.onFailure { lastErr = it }
+            Thread.sleep(150)
+        }
+        logger("…not present(quick): ${lastErr?.message ?: "no match"}")
+        return null
+    }
+
+    fun resolveCheckbox(targetHint: String?, nth: Int = 1, logger: (String) -> Unit = log): Locator {
+        val safeNth = nth.coerceAtLeast(1)
+
+        fun tryByXPath(xp: String, label: String): Locator? = try {
+            logger("try $label => $xp")
+            driver.findElement(AppiumBy.xpath(xp))
+            Locator(Strategy.XPATH, xp)
+        } catch (_: Exception) { null }
+
+        if (!targetHint.isNullOrBlank()) {
+            val toks = tokensOrdered(targetHint)
+            val lookahead = toks.joinToString("") { "(?=.*${Regex.escape(it)})" }
+            val rx = if (lookahead.isBlank()) "(?i).*" else "(?i)$lookahead.*"
+
+            val xml = driver.pageSource
+            val doc = Jsoup.parse(xml, "", org.jsoup.parser.Parser.xmlParser())
+
+            val labels = doc.select("node[text~=$rx], node[content-desc~=$rx]")
+            logger("checkbox label matches: ${labels.size}")
+
+            fun elementToXPath(e: Element): String {
+                val parts = mutableListOf<String>()
+                var cur: Element? = e
+                while (cur != null && cur.tagName() == "node") {
+                    val parent = cur.parent()
+                    val siblings = parent?.children()?.filter { it.tagName() == "node" }.orEmpty()
+                    val idx = siblings.indexOf(cur) + 1
+                    val cls = cur.attr("class")
+                    parts += if (cls.isNotBlank()) "*[@class='${cls}'][$idx]" else "node[$idx]"
+                    cur = parent
+                }
+                return "//" + parts.asReversed().joinToString("/")
+            }
+
+            // label → sibling/descendant with checkable=true; otherwise ancestor → descendant
+            for (lab in labels) {
+                (lab.siblingElements() + lab.allElements).forEach { cand ->
+                    val chk = cand.selectFirst("node[checkable=true]") ?: return@forEach
+                    val xp = elementToXPath(chk)
+                    tryByXPath(xp, "label-adjacent checkable")?.let { return it }
+                }
+                var anc: Element? = lab.parent()
+                repeat(4) {
+                    if (anc == null) return@repeat
+                    val chk = anc.selectFirst("node[checkable=true]")
+                    if (chk != null) {
+                        val xp = elementToXPath(chk)
+                        tryByXPath(xp, "ancestor-descendant checkable")?.let { return it }
+                    }
+                    anc = anc.parent()
+                }
+            }
+        }
+
+        val xpNth = "(//*[@checkable='true'])[$safeNth]"
+        tryByXPath(xpNth, "nth checkable")?.let { return it }
+
+        val xpClass = "(//*[@class and (contains(@class,'CheckBox') or contains(@class,'Switch') or contains(@class,'CompoundButton'))])[$safeNth]"
+        tryByXPath(xpClass, "nth class-based checkable")?.let { return it }
+
+        logger("fallback nth checkable (broad) -> $xpNth")
+        return Locator(Strategy.XPATH, xpNth)
+    }
+
 }
