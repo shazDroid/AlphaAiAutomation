@@ -1,12 +1,11 @@
 package generator
 
 import agent.ActionPlan
-import agent.Snapshot
 import agent.Locator
-import agent.Strategy
+import agent.Snapshot
 import agent.StepType
+import agent.Strategy
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import com.fasterxml.jackson.module.kotlin.readValue
 import ui.OllamaClient
 import java.io.File
 import java.time.LocalDateTime
@@ -21,6 +20,7 @@ class LlmScriptGenerator(
     fun generate(plan: ActionPlan, timeline: List<Snapshot>) {
         outDir.mkdirs()
 
+        // ---- SUMMARY_JSON ----------------------------------------------------------
         val summaryJson = mapper.writeValueAsString(
             mapOf(
                 "title" to plan.title,
@@ -35,7 +35,7 @@ class LlmScriptGenerator(
             )
         )
 
-        // Build locator records from snapshots (exact selectors actually used)
+        // ---- LOCATORS_JSON.bestByHint from snapshots ----------------------------------------
         data class LRec(
             val step: Int,
             val hint: String,
@@ -57,21 +57,22 @@ class LlmScriptGenerator(
             )
         }
 
-        fun stratRank(s: String) = when (s) { "ID" -> 4; "DESC" -> 3; "UIAUTOMATOR" -> 2; "XPATH" -> 1; else -> 1 }
+        fun stratRank(s: String) = when (s) {
+            "ID" -> 4; "DESC" -> 3; "UIAUTOMATOR" -> 2; "XPATH" -> 1; else -> 1
+        }
+
         val bestFromRecs: Map<String, String> =
             recs.groupBy { it.hint }
                 .mapValues { (_, group) ->
-                    group.maxWith(
-                        compareBy<LRec> { stratRank(it.strategy) }.thenBy { it.step }
-                    ).wdio
+                    group.maxWith(compareBy<LRec> { stratRank(it.strategy) }.thenBy { it.step }).wdio
                 }
 
+        // Ensure every referenced hint has a selector
         val mergedBestByHint = linkedMapOf<String, String>().apply { putAll(bestFromRecs) }
         val referencedHints = plan.steps
             .filter { it.type in setOf(StepType.INPUT_TEXT, StepType.TAP, StepType.WAIT_TEXT) }
             .mapNotNull { it.targetHint?.trim() }
             .filter { it.isNotEmpty() }
-
         for (hint in referencedHints) {
             if (!mergedBestByHint.containsKey(hint)) {
                 mergedBestByHint[hint] = fallbackSelectorFor(hint)
@@ -85,95 +86,127 @@ class LlmScriptGenerator(
             )
         )
 
-        // ---- Prompt (JSON) ----------------------------------------
-        val system = """
-            You are a senior test automation generator.
-            Return a SINGLE JSON object with EXACTLY these 4 keys and STRING values:
-            {
-              "BasePage.ts": "...",
-              "PlatformPage.ts": "...",
-              "StepDefinitions.ts": "...",
-              "feature.feature": "..."
-            }
-            No markdown. No backticks. No extra keys.
-            Target stack: WebdriverIO + Cucumber + Appium (Android).
-            RULES:
-            - Use the provided selectors in LOCATORS_JSON.bestByHint EXACTLY as given when implementing getters.
-              Do not invent different selectors.
-              WebdriverIO examples:
-                $('id=com.example:id/login')               // resource-id
-                $('~Login')                                // content-desc (accessibility id)
-                $('android=new UiSelector().textContains("Login")')
-                $('//hierarchy/...')                       // XPath
-            - BasePage.ts: abstract getters only (no inline selectors).
-            - PlatformPage.ts: extends BasePage and implements the getters using those exact selectors.
-            - StepDefinitions.ts: use getters only (no raw selectors).
-            - feature.feature: one concise scenario based on SUMMARY_JSON.title and steps.
-        """.trimIndent()
+        val selectorsJson = mapper.writeValueAsString(
+            mapOf("bestByHint" to mergedBestByHint) // ← no giant elements[] list
+        )
 
-        val user = buildString {
-            appendLine("SUMMARY_JSON:")
-            appendLine(summaryJson)
+        // ---- Prompt with strict markers ------------------------------------------------------
+        val userPrompt = buildString {
+            appendLine("You are a senior test automation generator for WebdriverIO + Cucumber + Appium (Android).")
+            appendLine("Do NOT output JSON. Do NOT echo the context. Output ONLY the four sections,")
+            appendLine("each wrapped by its exact start/end markers. Begin your reply with the line:")
+            appendLine("### BASE_CLASS_START")
             appendLine()
-            appendLine("LOCATORS_JSON:")
-            appendLine(locatorsJson)
+            appendLine("CONTEXT_JSON_START")
+            appendLine("SUMMARY_JSON:"); appendLine(summaryJson)
             appendLine()
-            appendLine("Produce ONLY the 4-key JSON object described above.")
+            appendLine("SELECTORS:"); appendLine(selectorsJson)
+            appendLine("CONTEXT_JSON_END")
+            appendLine()
+            appendLine("RULES:")
+            appendLine("- Never output an ActionPlan or any object with keys like \"title\" or \"steps\".")
+            appendLine("- Use SELECTORS.bestByHint EXACTLY for PlatformPage getters. No invented selectors.")
+            appendLine("- Use TypeScript code fences inside each section. Nothing outside markers.")
+            appendLine()
+            appendLine("### BASE_CLASS_START")
+            appendLine("TypeScript: abstract class `BasePage` with ONLY abstract getters for ALL hints present in SELECTORS.bestByHint.")
+            appendLine("Each getter signature:  public abstract get <camelName>(): ChainablePromiseElement<WebdriverIO.Element>;")
+            appendLine("```ts")
+            appendLine("export default abstract class BasePage {")
+            appendLine("  // example shape (real list must cover ALL hints)")
+            appendLine("  public abstract get login(): ChainablePromiseElement<WebdriverIO.Element>;")
+            appendLine("}")
+            appendLine("```")
+            appendLine("### BASE_CLASS_END")
+            appendLine()
+            appendLine("### PLATFORM_CLASS_START")
+            appendLine("TypeScript: class `PlatformPage` extends `BasePage`. Override EVERY getter using EXACT strings from SELECTORS.bestByHint.")
+            appendLine("Example form:  return $('id=com.example:id/loginBtn')  OR  return $('android=new UiSelector().text(\"Login\")');")
+            appendLine("```ts")
+            appendLine("import BasePage from './BasePage';")
+            appendLine("class PlatformPage extends BasePage { /* getters filled with SELECTORS.bestByHint */ }")
+            appendLine("export default new PlatformPage();")
+            appendLine("```")
+            appendLine("### PLATFORM_CLASS_END")
+            appendLine()
+            appendLine("### STEP_DEFS_START")
+            appendLine("TypeScript step defs using ONLY PlatformPage getters (no raw selectors):")
+            appendLine("- Given the app is launched")
+            appendLine("- When I type \"{value}\" into \"{hint}\"")
+            appendLine("- When I tap \"{hint}\"")
+            appendLine("- Then I should see \"{hint}\" (skip if empty)")
+            appendLine("Include a tiny helper that maps hints to the camelCase getter key.")
+            appendLine("```ts")
+            appendLine("// step defs here")
+            appendLine("```")
+            appendLine("### STEP_DEFS_END")
+            appendLine()
+            appendLine("### FEATURE_FILE_START")
+            appendLine("One concise .feature with Feature/Scenario following SUMMARY_JSON order.")
+            appendLine("```gherkin")
+            appendLine("// gherkin here")
+            appendLine("```")
+            appendLine("### FEATURE_FILE_END")
         }
 
-        // ---- Debug folder ---------------------------------------------------
+
+        // ---- Debug folder --------------------------------------------------------------------
         val stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
         val debugDir = outDir.resolve("_debug_$stamp").apply { mkdirs() }
         debugWrite(debugDir, "summary.json", summaryJson)
         debugWrite(debugDir, "locators.json", locatorsJson)
-        debugWrite(debugDir, "prompt.txt", user)
-        println("🟦 [Gen] Debug folder: ${debugDir.absolutePath}")
+        debugWrite(debugDir, "prompt_markers.txt", userPrompt)
 
-        // ---- LLM call -------------------------------------------------------
-        val raw = ollama.completeJsonBlocking(system = system, user = user)
-        debugWrite(debugDir, "raw_response.txt", raw)
+        // ---- LLM call (strict markers) -------------------------------------------------------
+        var raw = ollama.completeJsonBlocking(system = "", user = userPrompt)
+        debugWrite(debugDir, "raw_response_1.txt", raw)
 
-        val jsonBlob = extractJsonBlock(raw)
-        debugWrite(debugDir, "json_blob.txt", jsonBlob)
+        var baseBlock = extractMarked(raw, "BASE_CLASS_START", "BASE_CLASS_END")
+        var platformBlock = extractMarked(raw, "PLATFORM_CLASS_START", "PLATFORM_CLASS_END")
+        var stepsBlock = extractMarked(raw, "STEP_DEFS_START", "STEP_DEFS_END")
+        var featureBlock = extractMarked(raw, "FEATURE_FILE_START", "FEATURE_FILE_END")
 
-        var files: Map<String, String>? = parseOrCoerceToFileMap(jsonBlob)
+        // One repair attempt (LLM only) if any section missing
+        if (listOf(baseBlock, platformBlock, stepsBlock, featureBlock).any { it.isNullOrBlank() }) {
+            val repairPrompt = buildString {
+                appendLine("Your previous reply violated the format. Do NOT output JSON.")
+                appendLine("Start NOW with the line: ### BASE_CLASS_START")
+                appendLine("Then emit the four sections exactly as instructed. Nothing else.")
+                appendLine()
+                appendLine("CONTEXT_JSON_START")
+                appendLine("SUMMARY_JSON:"); appendLine(summaryJson)
+                appendLine()
+                appendLine("SELECTORS:"); appendLine(selectorsJson)
+                appendLine("CONTEXT_JSON_END")
+                appendLine()
+                appendLine("Sections to output verbatim in this order (each with fenced code inside):")
+                appendLine("### BASE_CLASS_START ... ### BASE_CLASS_END")
+                appendLine("### PLATFORM_CLASS_START ... ### PLATFORM_CLASS_END")
+                appendLine("### STEP_DEFS_START ... ### STEP_DEFS_END")
+                appendLine("### FEATURE_FILE_START ... ### FEATURE_FILE_END")
+            }
 
-        fun looksBad(s: String?): Boolean {
-            if (s.isNullOrBlank()) return true
-            val t = s.trim()
-            if (t.length < 80) return true
-            val badPhrases = listOf("abstract getters only", "use getters only", "one concise scenario")
-            return badPhrases.any { t.contains(it, ignoreCase = true) }
+            raw = ollama.completeJsonBlocking(system = "", user = repairPrompt)
+            debugWrite(debugDir, "raw_response_2_repair.txt", raw)
+
+            baseBlock = extractMarked(raw, "BASE_CLASS_START", "BASE_CLASS_END")
+            platformBlock = extractMarked(raw, "PLATFORM_CLASS_START", "PLATFORM_CLASS_END")
+            stepsBlock = extractMarked(raw, "STEP_DEFS_START", "STEP_DEFS_END")
+            featureBlock = extractMarked(raw, "FEATURE_FILE_START", "FEATURE_FILE_END")
         }
 
-        if (files == null || files.values.any { looksBad(it) }) {
-            println("🟨 [Gen] First attempt invalid. Trying one-shot repair…")
-            val repaired = retryFormatToFileMap(ollama, """
-                SUMMARY_JSON:
-                $summaryJson
+        require(!baseBlock.isNullOrBlank())     { "LLM failed to produce BASE_CLASS section" }
+        require(!platformBlock.isNullOrBlank()) { "LLM failed to produce PLATFORM_CLASS section" }
+        require(!stepsBlock.isNullOrBlank())    { "LLM failed to produce STEP_DEFS section" }
+        require(!featureBlock.isNullOrBlank())  { "LLM failed to produce FEATURE_FILE section" }
 
-                LOCATORS_JSON:
-                $locatorsJson
-
-                The 4 string fields must contain actual TypeScript/feature code.
-            """.trimIndent())
-            debugWrite(debugDir, "json_blob_fixed.txt", mapper.writeValueAsString(repaired))
-            files = repaired
-        }
-
-        if (files == null || files.values.any { looksBad(it) }) {
-            println("🟧 [Gen] Model still returned placeholders. Falling back to deterministic code.")
-            files = renderDeterministicFiles(plan, mergedBestByHint)
-            debugWrite(debugDir, "fallback_rendered.json", mapper.writeValueAsString(files))
-        }
-
-        println("🟦 [Gen] Final keys: ${files.keys}")
-        debugWrite(debugDir, "json_parsed_keys.txt", files.keys.joinToString("\n"))
-
-        require(!files["BasePage.ts"].isNullOrBlank()) { "LLM missing BasePage.ts" }
-        require(!files["PlatformPage.ts"].isNullOrBlank()) { "LLM missing PlatformPage.ts" }
-        require(!files["StepDefinitions.ts"].isNullOrBlank()) { "LLM missing StepDefinitions.ts" }
-        require(!files["feature.feature"].isNullOrBlank()) { "LLM missing feature.feature" }
+        val files = mapOf(
+            "BasePage.ts" to stripFences(baseBlock!!),
+            "PlatformPage.ts" to stripFences(platformBlock!!),
+            "StepDefinitions.ts" to stripFences(stepsBlock!!),
+            "feature.feature" to stripFences(featureBlock!!)
+        )
+        debugWrite(debugDir, "parsed_from_markers.json", mapper.writeValueAsString(files))
 
         write(outDir.resolve("pages"), "BasePage.ts", files["BasePage.ts"])
         write(outDir.resolve("pages"), "PlatformPage.ts", files["PlatformPage.ts"])
@@ -182,164 +215,6 @@ class LlmScriptGenerator(
 
         println("✅ [Gen] Scripts written to ${outDir.absolutePath}")
         debugWrite(debugDir, "done.txt", "OK")
-    }
-
-    // -------------------- Local deterministic templates ---------------------
-
-    private fun renderDeterministicFiles(
-        plan: ActionPlan,
-        bestByHint: Map<String, String>
-    ): Map<String, String> {
-        // Collect all hints (with selectors)  getters
-        val allHints = bestByHint.keys
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-
-        data class Entry(val hint: String, val prop: String, val selector: String, val rank: Int, val isInputLike: Boolean)
-
-        fun selectorRank(sel: String): Int =
-            when {
-                sel.startsWith("id=") -> 4
-                sel.startsWith("~") -> 3
-                sel.startsWith("android=") -> 2
-                else -> 1
-            }
-
-        fun isInputLike(h: String): Boolean {
-            val s = h.lowercase()
-            val isUser = Regex("\\b(user|username|email)\\b").containsMatchIn(s)
-            val isLoginField = Regex("\\blogin\\s+(id|name|field|input)\\b").containsMatchIn(s)
-            val isPass = Regex("\\b(pass|password|pwd)\\b").containsMatchIn(s) &&
-                    Regex("\\b(field|input)\\b").containsMatchIn(s)
-            val changePwd = Regex("\\b(change|reset|forgot)\\s+pass").containsMatchIn(s)
-            return (isUser || isLoginField || isPass) && !changePwd
-        }
-
-        val entries = allHints.map { h ->
-            val sel = bestByHint[h] ?: ""
-            Entry(
-                hint = h,
-                prop = propName(h),
-                selector = if (sel.isBlank()) fallbackSelectorFor(h) else sel,
-                rank = selectorRank(if (sel.isBlank()) fallbackSelectorFor(h) else sel),
-                isInputLike = isInputLike(h)
-            )
-        }
-
-        val dedup = linkedMapOf<String, Entry>()
-        for (e in entries) {
-            val prev = dedup[e.prop]
-            if (prev == null) {
-                dedup[e.prop] = e
-            } else {
-                val better = when {
-                    e.rank != prev.rank -> e.rank > prev.rank
-                    e.isInputLike != prev.isInputLike -> e.isInputLike
-                    else -> e.hint.length < prev.hint.length
-                }
-                if (better) dedup[e.prop] = e
-            }
-        }
-
-        val props = dedup.values.toList()
-
-        val basePage = buildString {
-            appendLine("import { ChainablePromiseElement } from 'webdriverio';")
-            appendLine()
-            appendLine("export default abstract class BasePage {")
-            for (p in props) {
-                appendLine("  public abstract get ${p.prop}(): ChainablePromiseElement<WebdriverIO.Element>;")
-            }
-            appendLine("}")
-        }
-
-        val platformPage = buildString {
-            appendLine("import BasePage from './BasePage';")
-            appendLine()
-            appendLine("class PlatformPage extends BasePage {")
-            for (p in props) {
-                appendLine("  public get ${p.prop}() { return $('${p.selector}'); }")
-            }
-            appendLine("}")
-            appendLine()
-            appendLine("export default new PlatformPage();")
-        }
-
-        val stepDefs = buildString {
-            appendLine("import { Given, When, Then } from '@cucumber/cucumber';")
-            appendLine("import { expect } from 'chai';")
-            appendLine("import Page from '../pages/PlatformPage';")
-            appendLine()
-            appendLine("const toCamel = (s: string) => s")
-            appendLine("  .replace(/[^a-zA-Z0-9]+/g, ' ')")
-            appendLine("  .trim()")
-            appendLine("  .split(/\\s+/)")
-            appendLine("  .map((w,i)=> i===0 ? w.toLowerCase() : (w.charAt(0).toUpperCase()+w.slice(1).toLowerCase()))")
-            appendLine("  .join('');")
-            appendLine()
-            appendLine("const toGetterKey = (hint: string) => {")
-            appendLine("  const s = hint.toLowerCase();")
-            appendLine("  const isUser = /(\\buser\\b|\\busername\\b|\\bemail\\b)/.test(s);")
-            appendLine("  const isLoginField = /\\blogin\\s+(id|name|field|input)\\b/.test(s);")
-            appendLine("  const isPass = /(\\bpass\\b|\\bpassword\\b|\\bpwd\\b)/.test(s) && /\\b(field|input)\\b/.test(s);")
-            appendLine("  const changePwd = /\\b(change|reset|forgot)\\s+pass/.test(s);")
-            appendLine("  if ((isUser || isLoginField) && !changePwd) return 'username';")
-            appendLine("  if (isPass && !changePwd) return 'password';")
-            appendLine("  return toCamel(hint);")
-            appendLine("};")
-            appendLine()
-            appendLine("Given('the app is launched', async () => {")
-            appendLine("  // Assume app is launched by the runner; no-op here")
-            appendLine("});")
-            appendLine()
-            appendLine("When('I type {string} into {string}', async (value: string, hint: string) => {")
-            appendLine("  const key = toGetterKey(hint);")
-            appendLine("  const el: any = (Page as any)[key];")
-            appendLine("  await el.waitForExist({ timeout: 30000 });")
-            appendLine("  await el.setValue(value);")
-            appendLine("});")
-            appendLine()
-            appendLine("When('I tap {string}', async (hint: string) => {")
-            appendLine("  const key = toGetterKey(hint);")
-            appendLine("  const el: any = (Page as any)[key];")
-            appendLine("  await el.waitForExist({ timeout: 30000 });")
-            appendLine("  await el.click();")
-            appendLine("});")
-            appendLine()
-            appendLine("Then('I should see {string}', async (hint: string) => {")
-            appendLine("  if (!hint) return; // skip empty assertions")
-            appendLine("  const key = toGetterKey(hint);")
-            appendLine("  const el: any = (Page as any)[key];")
-            appendLine("  await el.waitForExist({ timeout: 45000 });")
-            appendLine("  expect(await el.isExisting()).to.equal(true);")
-            appendLine("});")
-        }
-
-        val feature = buildString {
-            appendLine("Feature: ${plan.title.ifBlank { "Flow" }}")
-            appendLine()
-            appendLine("  Scenario: ${plan.title.ifBlank { "Run flow" }}")
-            appendLine("    Given the app is launched")
-            for (s in plan.steps.sortedBy { it.index }) {
-                when (s.type) {
-                    StepType.INPUT_TEXT ->
-                        appendLine("    When I type \"${s.value ?: ""}\" into \"${s.targetHint ?: ""}\"")
-                    StepType.TAP ->
-                        appendLine("    And I tap \"${s.targetHint ?: ""}\"")
-                    StepType.WAIT_TEXT ->
-                        if (!s.targetHint.isNullOrBlank())
-                            appendLine("    Then I should see \"${s.targetHint}\"")
-                    else -> {}
-                }
-            }
-        }
-
-        return mapOf(
-            "BasePage.ts" to basePage,
-            "PlatformPage.ts" to platformPage,
-            "StepDefinitions.ts" to stepDefs,
-            "feature.feature" to feature
-        )
     }
 
     // --------------------------- Helpers ------------------------------------
@@ -368,32 +243,8 @@ class LlmScriptGenerator(
         return if (s == s.uppercase()) s else s.replaceFirstChar { it.uppercase() }
     }
 
-    private fun propName(hint: String): String {
-        val s = hint.lowercase()
-        val changePwd = Regex("\\b(change|reset|forgot)\\s+pass").containsMatchIn(s)
-        val usernameLike = Regex("\\b(user|username|email)\\b").containsMatchIn(s) ||
-                Regex("\\blogin\\s+(id|name|field|input)\\b").containsMatchIn(s)
-        val passwordLike = Regex("\\b(pass|password|pwd)\\b").containsMatchIn(s) &&
-                Regex("\\b(field|input)\\b").containsMatchIn(s)
-        return when {
-            usernameLike && !changePwd -> "username"
-            passwordLike && !changePwd -> "password"
-            else -> toCamel(hint)
-        }
-    }
-
-    private fun toCamel(s: String): String =
-        s.replace(Regex("[^A-Za-z0-9]+"), " ")
-            .trim()
-            .split(Regex("\\s+"))
-            .mapIndexed { i, w ->
-                val ww = w.lowercase()
-                if (i == 0) ww else ww.replaceFirstChar { it.uppercase() }
-            }
-            .joinToString("")
-
     private fun write(dir: File, name: String, content: String?) {
-        require(!content.isNullOrBlank()) { "LLM missing $name" }
+        require(!content.isNullOrBlank()) { "Missing content for $name" }
         dir.mkdirs()
         File(dir, name).writeText(content!!)
     }
@@ -402,46 +253,14 @@ class LlmScriptGenerator(
         try { File(folder, name).writeText(data) } catch (_: Throwable) {}
     }
 
-    private fun extractJsonBlock(src: String): String {
-        val fenced = Regex("```(?:json)?\\s*(\\{.*?\\})\\s*```", RegexOption.DOT_MATCHES_ALL)
-            .find(src)?.groupValues?.get(1)
-        if (fenced != null) return fenced.trim()
-        val i = src.indexOf('{'); val j = src.lastIndexOf('}')
-        return if (i != -1 && j > i) src.substring(i, j + 1).trim() else src.trim()
+    private fun extractMarked(src: String, start: String, end: String): String? {
+        val re = Regex("###\\s+$start\\s*\\n(.*?)\\n###\\s+$end", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        return re.find(src)?.groupValues?.get(1)?.trim()
     }
 
-    private fun parseOrCoerceToFileMap(blob: String): Map<String, String>? {
-        return try {
-            val n = mapper.readTree(blob)
-            if (!n.isObject) return null
-            val keys = listOf("BasePage.ts","PlatformPage.ts","StepDefinitions.ts","feature.feature")
-            when {
-                keys.all { n.has(it) && n.get(it).isTextual } ->
-                    keys.associateWith { n.get(it).asText() }
-                n.has("files") && n.get("files").isObject -> {
-                    val f = n.get("files")
-                    if (keys.all { f.has(it) && f.get(it).isTextual })
-                        keys.associateWith { f.get(it).asText() } else null
-                }
-                else -> null
-            }
-        } catch (_: Exception) { null }
-    }
-
-    private fun retryFormatToFileMap(ollama: OllamaClient, blob: String): Map<String, String> {
-        val sys = """
-            Convert arbitrary content into a JSON object with exactly 4 string fields:
-            "BasePage.ts","PlatformPage.ts","StepDefinitions.ts","feature.feature".
-            Respond with JSON only. No markdown. No extra keys. The string values must be valid TypeScript (or Gherkin in feature.feature), not descriptions.
-        """.trimIndent()
-        val usr = """
-            Convert the following to the required 4-key JSON; replace any placeholders with full code:
-            ----
-            $blob
-            ----
-        """.trimIndent()
-        val raw = ollama.completeJsonBlocking(system = sys, user = usr)
-        val json = extractJsonBlock(raw)
-        return mapper.readValue(json)
+    private fun stripFences(code: String): String {
+        val m = Regex("^```[a-zA-Z]*\\s*\\n([\\s\\S]*?)\\n```\\s*$", RegexOption.MULTILINE)
+        val mm = m.find(code)
+        return (mm?.groupValues?.get(1) ?: code).trim()
     }
 }

@@ -1,30 +1,32 @@
 // util/UiHintsBuilder.kt
 package util
 
-import agent.Snapshot
-import org.jsoup.Jsoup
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import java.io.File
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 
-object UiHintsBuilder {
-    private val mapper = jacksonObjectMapper().registerKotlinModule()
+object UiHelper {
+    fun colorForLog(line: String): Color = when {
+        "❌" in line || "FAIL" in line || "error" in line.lowercase() -> Color(0xFFD32F2F) // red
+        "✓" in line || " OK" in line || "Done" in line -> Color(0xFF2E7D32)              // green
+        "retry(" in line || "retry " in line -> Color(0xFFF9A825)                         // amber
+        "WAIT" in line || "scroll" in line.lowercase() -> Color(0xFF1565C0)               // blue
+        else -> Color(0xffffffff)
+    }
 
-    fun extractHints(timeline: List<Snapshot>): String {
-        val all = mutableListOf<Map<String, String>>()
-        timeline.forEach { snap ->
-            val xml = File(snap.pageSourcePath).takeIf { it.exists() }?.readText() ?: return@forEach
-            val doc = Jsoup.parse(xml, "", org.jsoup.parser.Parser.xmlParser())
-            doc.select("node").forEach { n ->
-                val id = n.attr("resource-id")
-                val text = n.attr("text")
-                val desc = n.attr("content-desc")
-                val clazz = n.attr("class")
-                if (id.isNotBlank() || text.isNotBlank() || desc.isNotBlank()) {
-                    all += mapOf("id" to id, "text" to text, "desc" to desc, "class" to clazz)
-                }
+    fun styleLogLine(line: String): AnnotatedString {
+        val i = line.indexOf(']')
+        return buildAnnotatedString {
+            if (i > 0) {
+                // time
+                append(AnnotatedString(line.substring(0, i + 1), SpanStyle(color = Color.Gray)))
+                append(" ")
+                // message
+                append(AnnotatedString(line.substring(i + 1).trimStart(), SpanStyle(color = colorForLog(line))))
+            } else {
+                append(AnnotatedString(line, SpanStyle(color = colorForLog(line))))
             }
         }
-        return mapper.writeValueAsString(all)
     }
 }

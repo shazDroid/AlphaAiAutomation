@@ -14,10 +14,15 @@ import agent.SnapshotStore
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.desktop.ui.tooling.preview.Preview
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -29,12 +34,13 @@ import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.onPointerEvent
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.TextUnitType
 import androidx.compose.ui.unit.dp
-import appium.DriverFactory
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import contentScale.ContentScale
@@ -50,8 +56,10 @@ import ui.component.AlphaButton
 import ui.component.AlphaInputText
 import ui.component.AlphaInputTextMultiline
 import ui.component.AlphaTabRow
+import ui.component.ChipPill
+import ui.component.RightCard
+import ui.component.TimelineItem
 import ui.theme.BLUE
-import util.PromptBuilder
 import util.TargetMapper
 import util.extractCodeBetweenMarkers
 import utils.KottieConstants
@@ -60,39 +68,49 @@ import yaml.YamlFlowLoader
 import java.awt.Desktop
 import java.io.File
 import java.io.FileOutputStream
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
+
+/* ---------- Theme accents ---------- */
+private val SurfaceBG = Color(0xFFF5F7FF)
+private val CardBG = Color(0xFFFFFFFF)
+private val Accent = Color(BLUE)
+private val Subtle = Color(0xFFE8ECFF)
+private val Line = Color(0xFFE3E3E3)
+
+private val LOG_TIME_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("hh:mm:ss a")
 
 @Preview
 @Composable
 fun AppUI() {
     val mapper = ObjectMapper().registerKotlinModule()
+
+    // device & flow
     var devices by remember { mutableStateOf(listOf<String>()) }
     var selectedDevice by remember { mutableStateOf("") }
     var packageName by remember { mutableStateOf("com.ksaemiratesnbd.android.uat") }
     var uiElements by remember { mutableStateOf(listOf<UiElement>()) }
-    var showAnimation by remember { mutableStateOf(true) }
 
+    // main ui states
+    var showAnimation by remember { mutableStateOf(true) }
+    var playing by remember { mutableStateOf(true) }
+    val scope = rememberCoroutineScope()
+
+    // generator outputs & tabs
     var yamlContent by remember { mutableStateOf("") }
     var parsedFlow by remember { mutableStateOf<TestFlow?>(null) }
-
     var isLoading by remember { mutableStateOf(false) }
     var featureFlowName by remember { mutableStateOf("") }
     var isCapturedDone by remember { mutableStateOf(false) }
 
-
-    // Tab states
     var selectedTab by remember { mutableStateOf(0) }
     val tabTitles = listOf("UI Dump", "Base Class", "Platform class", "Step Definitions", "Feature File")
     var baseClassOutput by remember { mutableStateOf("") }
     var platformClassOutput by remember { mutableStateOf("") }
     var stepDefinitionsOutput by remember { mutableStateOf("") }
     var featureFileOutput by remember { mutableStateOf("") }
-    var animation by remember { mutableStateOf("") }
-    val scope = rememberCoroutineScope()
 
-    var parsingUiDump by remember { mutableStateOf(false) }
-
-    var playing by remember { mutableStateOf(true) }
-
+    // agent states
     var agentTimeline by remember { mutableStateOf<List<Snapshot>>(emptyList()) }
     val agentLogs = remember { mutableStateListOf<String>() }
     var agentStatus by remember { mutableStateOf<String?>(null) }
@@ -101,438 +119,453 @@ fun AppUI() {
     var isAgentRunning by remember { mutableStateOf(false) }
     var showAgentView by remember { mutableStateOf(false) }
 
+
     // live screen
     var agentImage by remember { mutableStateOf<ImageBitmap?>(null) }
     LaunchedEffect(isAgentRunning, selectedDevice) {
         while (isAgentRunning && selectedDevice.isNotBlank()) {
             AdbExecutor.screencapPng(selectedDevice)?.let { bytes ->
-                val img = org.jetbrains.skia.Image.makeFromEncoded(bytes).asImageBitmap()
-                agentImage = img
+                agentImage = org.jetbrains.skia.Image.makeFromEncoded(bytes).asImageBitmap()
             }
             delay(700)
         }
     }
 
-
-    LaunchedEffect(Unit) {
-        animation = ({}.javaClass.getResourceAsStream("/drawable/robot_animation.json")
-            ?: throw IllegalArgumentException("Resource not found")).bufferedReader().use { it.readText() }
+    // logs: prepend + auto scroll to top
+    val logListState = rememberLazyListState()
+    LaunchedEffect(agentLogs.size) {
+        if (agentLogs.isNotEmpty()) {
+            delay(10)
+            logListState.scrollToItem(0)
+        }
     }
 
-    val composition = rememberKottieComposition(
-        spec = KottieCompositionSpec.File(animation) // Or KottieCompositionSpec.Url || KottieCompositionSpec.JsonString
-    )
+    // log panel resize via drag
+    var logHeight by remember { mutableStateOf(220.dp) }
+    val minLogHeight = 120.dp
+    val maxLogHeight = 600.dp
+    val density = LocalDensity.current
+    val dragState = rememberDraggableState { deltaYPx ->
+        val dy = with(density) { deltaYPx.toDp() }
+        logHeight = (logHeight + dy).coerceIn(minLogHeight, maxLogHeight)
+    }
 
+    // animation json
+    var animation by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        animation = ({}.javaClass.getResourceAsStream("/drawable/robot_animation.json")
+            ?: throw IllegalArgumentException("Resource not found"))
+            .bufferedReader().use { it.readText() }
+    }
+    val composition = rememberKottieComposition(spec = KottieCompositionSpec.File(animation))
     val animationState by animateKottieCompositionAsState(
         composition = composition,
         isPlaying = playing,
         iterations = KottieConstants.IterateForever
     )
-
-    LaunchedEffect(key1 = "1") {
+    LaunchedEffect(key1 = "intro") {
         scope.launch(Dispatchers.IO) {
-            delay(4000L)
-            playing = false
+            delay(2800L); playing = false
         }
     }
 
-    Row(modifier = Modifier.fillMaxSize()) {
+    /* ===================== LAYOUT ===================== */
+    Box(Modifier.fillMaxSize().background(SurfaceBG)) {
+        Row(Modifier.fillMaxSize()) {
 
-        // Left Pane
-        Column(
-            modifier = Modifier.weight(0.2f)
-                .padding(16.dp)
-                .verticalScroll(rememberScrollState())
-        ) {
-
-            Box(
-                modifier = Modifier.fillMaxWidth()
-                    .background(color = Color(0xFF2C3EAF), shape = RoundedCornerShape(size = 12.dp)).padding(12.dp)
+            /* -------- Left rail (controls) -------- */
+            Column(
+                modifier = Modifier.weight(0.24f)
+                    .fillMaxHeight()
+                    .padding(16.dp)
+                    .verticalScroll(rememberScrollState())
             ) {
-                Row(modifier = Modifier, verticalAlignment = Alignment.CenterVertically) {
-                    Image(
-                        modifier = Modifier.size(64.dp),
-                        painter = painterResource("drawable/app_icon.png"),
-                        contentDescription = null,
-                        colorFilter = ColorFilter.tint(Color.White)
-                    )
+                BrandCard()
+                Spacer(Modifier.height(16.dp))
 
-                    Spacer(modifier = Modifier.size(16.dp))
+                SectionTitle("Devices")
 
-                    Column() {
-                        Text(
-                            modifier = Modifier.fillMaxWidth(),
-                            text = "Alpha Automation",
-                            fontWeight = MaterialTheme.typography.h6.fontWeight,
-                            color = Color.White
-                        )
-                        Spacer(modifier = Modifier.size(2.dp))
-
-                        Text(
-                            modifier = Modifier.fillMaxWidth(),
-                            text = "developed by shahbaz ansari",
-                            fontWeight = MaterialTheme.typography.h2.fontWeight,
-                            fontSize = TextUnit(12f, TextUnitType.Sp),
-                            color = Color.White
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(text = "Devices", fontWeight = MaterialTheme.typography.h6.fontWeight)
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Box(
-                modifier = Modifier.fillMaxWidth()
-                    .background(color = Color(0xFFEDF3FF), shape = RoundedCornerShape(size = 12.dp)).padding(12.dp)
-            ) {
-                Column() {
-                    if (selectedDevice.isEmpty()) {
-                        DeviceNotSelectedError {
+                CardBox {
+                    Column {
+                        if (selectedDevice.isEmpty()) DeviceNotSelectedError {
                             devices = AdbExecutor.listDevices()
-                        }
-                    } else {
-                        DeviceSelected()
-                    }
+                        } else DeviceSelected()
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                        Spacer(Modifier.height(8.dp))
 
-                    // show device list if visible
-                    if (devices.isNotEmpty()) {
-                        Text(
-                            text = if (selectedDevice.isEmpty()) "Device list" else "Selected device: $selectedDevice",
-                            fontWeight = MaterialTheme.typography.h6.fontWeight
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        AnimatedVisibility(selectedDevice.isEmpty()) {
-                            LazyColumn(modifier = Modifier.fillMaxWidth().height(200.dp)) {
-                                items(devices) { item ->
-                                    DeviceItem(item, onDeviceSelected = { currentSelectedDevice ->
-                                        selectedDevice = currentSelectedDevice
-                                    })
-                                }
-                            }
-                        }
-
-                        AnimatedVisibility(selectedDevice.isNotEmpty()) {
-                            AlphaButton(text = "Rescan devices") {
-                                selectedDevice = ""
-                            }
-                        }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            AnimatedVisibility(selectedDevice.isNotEmpty()) {
-                Text(text = "Yaml Editor", fontWeight = MaterialTheme.typography.h6.fontWeight)
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            AnimatedVisibility(selectedDevice.isNotEmpty()) {
-                AlphaInputTextMultiline(
-                    value = yamlContent,
-                    onValueChange = { yamlContent = it },
-                    hint = "Enter YAML flow here",
-                    backgroundColor = Color(0xFFEDF3FF)
-                )
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            AnimatedVisibility(yamlContent.isNotEmpty()) {
-                CaptureUiDump(isCaptureDone = isCapturedDone, onClick = {
-                    isCapturedDone = false
-                    scope.launch(Dispatchers.IO) {
-                        playing = true
-                        // ✅ Parse YAML here to initialize parsedFlow
-                        if (yamlContent.isNotBlank()) {
-                            try {
-                                val flow = YamlFlowLoader.loadFlowFromString(yamlContent)
-                                parsedFlow = flow
-                                println("Parsed flow loaded before UI dump: $parsedFlow")
-                            } catch (e: Exception) {
-                                println("YAML parsing error: ${e.message}")
-                            }
-                        } else {
-                            println("YAML content is blank. parsedFlow remains null.")
-                        }
-
-                        val xml = UiDumpParser.getUiDumpXml(selectedDevice)
-                        println("XML Dump: \n $xml")
-
-                        val cleanedXml = cleanUiDumpXml(xml)
-                        val parsed = UiDumpParser.parseUiDump(cleanedXml).toMutableList()
-
-                        // Dynamic resolution for text_input actions using parsedFlow
-                        parsedFlow?.flow?.forEach { action ->
-                            if (action.action == "input_text" && !action.target_text.isNullOrEmpty()) {
-                                val editText = UiDumpParser.findEditTextForLabel(cleanedXml, action.target_text)
-                                if (editText != null) {
-                                    println("Resolved EditText for target '${action.target_text}': $editText")
-                                    parsed.add(editText)
-                                } else {
-                                    println("No EditText found for target '${action.target_text}'")
-                                }
-                            }
-                        }
-
-                        uiElements = parsed
-                        println("UI Dump (updated): \n$uiElements")
-                        isCapturedDone = true
-                        playing = false
-                    }
-                }, onPackageNameChange = {
-                    packageName = it
-                }, onFlowFeatureNameChange = {
-                    featureFlowName = it
-                })
-            }
-
-
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            AgentComponent(
-                selectedDevice = selectedDevice,
-                packageName = packageName,
-                onShowAgentView = { showAgentView = true; showAnimation = false },
-                onStatus = { s -> agentStatus = s },
-                onLog = { line ->
-                    val ts = java.time.LocalTime.now().toString().substring(0, 8)
-                    agentLogs.add(0, "[$ts] $line")
-                    if (agentLogs.size > 400) agentLogs.removeLast()
-                },
-                onTimelineUpdate = { list ->
-                    agentTimeline = list
-                    agentCompletedSteps = list.size
-                },
-                onRunState = { running, total ->
-                    isAgentRunning = running
-                    agentTotalSteps = total
-                    if (running) showAgentView = true
-                }
-            )
-
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            AlphaButton(isLoading = isLoading, text = "Generate with AI", onClick = {
-                showAnimation = true
-                playing = true
-
-                if (yamlContent.isBlank()) {
-                    baseClassOutput = "Please enter YAML flow first."
-                    return@AlphaButton
-                }
-
-                scope.launch(Dispatchers.IO) {
-                    isLoading = true
-
-                    try {
-                        val fullOutput = StringBuilder()
-
-
-                        var flow = YamlFlowLoader.loadFlowFromString(yamlContent)
-                        val (updatedFlow, actionableElements) = TargetMapper.mapTargets(flow, uiElements)
-
-                        parsedFlow = flow
-
-
-                        baseClassOutput = ""
-                        platformClassOutput = ""
-                        stepDefinitionsOutput = ""
-                        featureFileOutput = ""
-
-                        val prompt = PromptBuilder.buildPrompt(featureFlowName, updatedFlow, actionableElements)
-
-
-                        OllamaClient.sendPromptStreaming(
-                            prompt,
-                            onChunk = { chunk ->
-                                val cleanedChunk = chunk.trim()
-                                if (cleanedChunk.isNotEmpty()) {
-                                    try {
-                                        val jsonNode = mapper.readTree(cleanedChunk)
-                                        val content = jsonNode["message"]?.get("content")?.asText() ?: ""
-                                        fullOutput.append(content)
-                                    } catch (e: Exception) {
-                                        println("Chunk parsing issue: ${e.message}")
+                        if (devices.isNotEmpty()) {
+                            Text(
+                                text = if (selectedDevice.isEmpty()) "Device list" else "Selected: $selectedDevice",
+                                fontWeight = MaterialTheme.typography.h6.fontWeight
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            AnimatedVisibility(selectedDevice.isEmpty()) {
+                                LazyColumn(Modifier.fillMaxWidth().height(200.dp)) {
+                                    items(devices) { item ->
+                                        DeviceItem(item) { selectedDevice = it }
                                     }
                                 }
-                            },
-                            onComplete = {
-                                playing = false
-                                showAnimation = false
-                                isLoading = false
-                                val outputText = fullOutput.toString()
-                                println("Full text output: $outputText")
-                                baseClassOutput = extractCodeBetweenMarkers(outputText, "BASE_CLASS_START", "BASE_CLASS_END")
-                                platformClassOutput = extractCodeBetweenMarkers(outputText, "PLATFORM_CLASS_START", "PLATFORM_CLASS_END")
-                                stepDefinitionsOutput = extractCodeBetweenMarkers(outputText, "STEP_DEFS_START", "STEP_DEFS_END")
-                                featureFileOutput = extractCodeBetweenMarkers(outputText, "FEATURE_FILE_START", "FEATURE_FILE_END")
-                                isLoading = false
                             }
-
-                        )
-                    } catch (e: Exception) {
-                        println("Error: ${e.message}")
-                        isLoading = false
+                            AnimatedVisibility(selectedDevice.isNotEmpty()) {
+                                AlphaButton(text = "Rescan devices") { selectedDevice = "" }
+                            }
+                        }
                     }
                 }
 
-            })
-        }
-
-        // Divider
-        VerticalDivider(modifier = Modifier.padding(vertical = 24.dp), color = Color(0xffe3e3e3))
-
-        // Right Pane
-
-        Column(
-            modifier = Modifier.weight(0.6f).padding(16.dp)
-        ) {
-            val showAgent = showAgentView || isAgentRunning || agentTimeline.isNotEmpty()
-
-            if (!showAgent) {
-                if (showAnimation) {
-                    Row(
-                        modifier = Modifier.fillMaxSize(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            KottieAnimation(
-                                composition = composition,
-                                modifier = Modifier.size(300.dp),
-                                progress = {
-                                    animationState.progress
+                Spacer(Modifier.height(16.dp))
+                AnimatedVisibility(selectedDevice.isNotEmpty()) {
+                    Column {
+                        SectionTitle("YAML editor")
+                        Spacer(Modifier.height(8.dp))
+                        AlphaInputTextMultiline(
+                            value = yamlContent,
+                            onValueChange = { yamlContent = it },
+                            hint = "Enter YAML flow here",
+                            backgroundColor = Subtle
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        AnimatedVisibility(yamlContent.isNotEmpty()) {
+                            CaptureUiDump(
+                                isCaptureDone = isCapturedDone,
+                                onClick = {
+                                    isCapturedDone = false
+                                    scope.launch(Dispatchers.IO) {
+                                        // intro loop visual
+                                        playing = true
+                                        // parse flow
+                                        if (yamlContent.isNotBlank()) {
+                                            runCatching {
+                                                parsedFlow = YamlFlowLoader.loadFlowFromString(yamlContent)
+                                            }
+                                        }
+                                        // capture & enrich
+                                        val xml = UiDumpParser.getUiDumpXml(selectedDevice)
+                                        val cleanedXml = cleanUiDumpXml(xml)
+                                        val parsed = UiDumpParser.parseUiDump(cleanedXml).toMutableList()
+                                        parsedFlow?.flow?.forEach { action ->
+                                            if (action.action == "input_text" && !action.target_text.isNullOrEmpty()) {
+                                                UiDumpParser.findEditTextForLabel(cleanedXml, action.target_text)?.let {
+                                                    parsed.add(it)
+                                                }
+                                            }
+                                        }
+                                        uiElements = parsed
+                                        isCapturedDone = true
+                                        playing = false
+                                    }
                                 },
-                                backgroundColor = Color.Transparent,
-                                contentScale = ContentScale.Fit
+                                onPackageNameChange = { packageName = it },
+                                onFlowFeatureNameChange = { featureFlowName = it }
                             )
-                            Spacer(modifier = Modifier.size(26.dp))
-                            Text(
-                                text = if (isLoading) "Please wait" else "Welcome to Alpha AI Automation",
-                                fontWeight = MaterialTheme.typography.h6.fontWeight,
-                                fontSize = TextUnit(22f, TextUnitType.Sp)
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(16.dp))
+                AgentComponent(
+                    selectedDevice = selectedDevice,
+                    packageName = packageName,
+                    onShowAgentView = { showAgentView = true; showAnimation = false },
+                    onStatus = { agentStatus = it },
+                    onLog = { line ->
+                        val ts = LocalDateTime.now().format(LOG_TIME_FMT)
+                        agentLogs.add(0, "[$ts] $line")
+                        if (agentLogs.size > 600) agentLogs.removeLast()
+                    },
+                    onTimelineUpdate = { list ->
+                        agentTimeline = list; agentCompletedSteps = list.size
+                    },
+                    onRunState = { running, total ->
+                        isAgentRunning = running; agentTotalSteps = total
+                        if (running) showAgentView = true
+                    },
+                    isParsingTask = {
+                        playing = it; showAnimation = it
+                    }
+                )
+
+                Spacer(Modifier.height(16.dp))
+                AlphaButton(isLoading = isLoading, text = "Generate with AI") {
+                    if (yamlContent.isBlank()) {
+                        baseClassOutput = "Please enter YAML flow first."
+                        return@AlphaButton
+                    }
+                    showAnimation = true; playing = true
+                    scope.launch(Dispatchers.IO) {
+                        isLoading = true
+                        try {
+                            val full = StringBuilder()
+                            val flow = YamlFlowLoader.loadFlowFromString(yamlContent)
+                            val (updated, actionable) = TargetMapper.mapTargets(flow, uiElements)
+                            parsedFlow = flow
+                            baseClassOutput = ""; platformClassOutput = ""; stepDefinitionsOutput =
+                                ""; featureFileOutput = ""
+                            val prompt = util.PromptBuilder.buildPrompt(featureFlowName, updated, actionable)
+
+                            OllamaClient.sendPromptStreaming(
+                                prompt,
+                                onChunk = { chunk ->
+                                    val t = chunk.trim()
+                                    if (t.isNotEmpty()) {
+                                        runCatching {
+                                            val node = mapper.readTree(t)
+                                            val content = node["message"]?.get("content")?.asText() ?: ""
+                                            full.append(content)
+                                        }
+                                    }
+                                },
+                                onComplete = {
+                                    playing = false; showAnimation = false; isLoading = false
+                                    val out = full.toString()
+                                    baseClassOutput =
+                                        extractCodeBetweenMarkers(out, "BASE_CLASS_START", "BASE_CLASS_END")
+                                    platformClassOutput =
+                                        extractCodeBetweenMarkers(out, "PLATFORM_CLASS_START", "PLATFORM_CLASS_END")
+                                    stepDefinitionsOutput =
+                                        extractCodeBetweenMarkers(out, "STEP_DEFS_START", "STEP_DEFS_END")
+                                    featureFileOutput =
+                                        extractCodeBetweenMarkers(out, "FEATURE_FILE_START", "FEATURE_FILE_END")
+                                }
                             )
-                            Spacer(modifier = Modifier.size(4.dp))
-                            Text(
-                                text = if (isLoading) "Generating response..." else "Generate BaseClass, Platform, StepsDefs, Feature file with AI",
-                                fontWeight = MaterialTheme.typography.h1.fontWeight,
-                                fontSize = TextUnit(14f, TextUnitType.Sp)
-                            )
-                            Spacer(modifier = Modifier.size(16.dp))
-                            AnimatedVisibility(isLoading.not()) {
-                                AlphaButton(
-                                    modifier = Modifier.fillMaxWidth(fraction = 0.3f),
-                                    text = "Need help, read documentation"
-                                ) {
-                                    openPdfFromResources("files/documentation.pdf")
+                        } catch (e: Exception) {
+                            println("Error: ${e.message}")
+                        } finally {
+                            isLoading = false
+                        }
+                    }
+                }
+            }
+
+            VerticalDivider(modifier = Modifier.padding(vertical = 24.dp), color = Line)
+
+            /* -------- Right content (workspace) -------- */
+            Column(modifier = Modifier.weight(0.76f).padding(16.dp)) {
+                val showAgent = showAgentView || isAgentRunning || agentTimeline.isNotEmpty()
+
+                if (!showAgent) {
+                    if (showAnimation) {
+                        Row(
+                            modifier = Modifier.fillMaxSize(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                KottieAnimation(
+                                    composition = composition,
+                                    modifier = Modifier.size(260.dp),
+                                    progress = { animationState.progress },
+                                    backgroundColor = Color.Transparent,
+                                    contentScale = ContentScale.Fit
+                                )
+                                Spacer(Modifier.height(18.dp))
+                                Text(
+                                    text = if (isLoading) "Please wait" else "Welcome to Alpha AI Automation",
+                                    fontWeight = MaterialTheme.typography.h6.fontWeight,
+                                    fontSize = TextUnit(22f, TextUnitType.Sp)
+                                )
+                                Spacer(Modifier.height(6.dp))
+                                Text(
+                                    text = if (isLoading) "Generating response..." else "Generate Base, Platform, Steps & Feature via AI",
+                                    fontWeight = MaterialTheme.typography.h1.fontWeight,
+                                    fontSize = TextUnit(14f, TextUnitType.Sp),
+                                    color = Color.DarkGray
+                                )
+                                Spacer(Modifier.height(16.dp))
+                                AnimatedVisibility(isLoading.not()) {
+                                    AlphaButton(
+                                        modifier = Modifier.fillMaxWidth(0.32f),
+                                        text = "Need help? Read documentation"
+                                    ) { openPdfFromResources("files/documentation.pdf") }
                                 }
                             }
+                        }
+                    } else {
+                        AlphaTabRow(
+                            tabs = tabTitles,
+                            selectedTabIndex = selectedTab,
+                            onTabSelected = { selectedTab = it }
+                        )
+                        when (selectedTab) {
+                            0 -> CodeBlock(uiElements.toString(), "plain")
+                            1 -> CodeBlock(baseClassOutput, "typescript")
+                            2 -> CodeBlock(platformClassOutput, "typescript")
+                            3 -> CodeBlock(stepDefinitionsOutput, "typescript")
+                            4 -> CodeBlock(featureFileOutput, "gherkin")
                         }
                     }
                 } else {
-                    AlphaTabRow(
-                        tabs = tabTitles,
-                        selectedTabIndex = selectedTab,
-                        onTabSelected = { selectedTab = it }
+                    // ==== AGENT VIEW ====
+                    Text("Agent run", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                    Spacer(Modifier.height(8.dp))
+
+// thin accent bar like the mock
+                    LinearProgressIndicator(
+                        progress = if (agentTotalSteps > 0) agentCompletedSteps.toFloat() / agentTotalSteps else 0f,
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color(0xFF6A7BFF),
+                        backgroundColor = Color(0xFFE9ECFF)
                     )
-                    when (selectedTab) {
-                        0 -> CodeBlock(uiElements.toString(), "plain")
-                        1 -> CodeBlock(baseClassOutput, "typescript")
-                        2 -> CodeBlock(platformClassOutput, "typescript")
-                        3 -> CodeBlock(stepDefinitionsOutput, "typescript")
-                        4 -> CodeBlock(featureFileOutput, "gherkin")
-                    }
-                }
-            } else {
-                // ==== AGENT VIEW ====
-                Text("Agent run", fontWeight = MaterialTheme.typography.h6.fontWeight)
-                Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(12.dp))
 
-                // top row: live device + progress
-                Row(Modifier.fillMaxWidth()) {
-                    Box(
-                        modifier = Modifier.weight(0.55f)
-                            .height(360.dp)
-                            .background(Color(0xFFF8F8F8), RoundedCornerShape(12.dp))
-                            .border(1.dp, Color(0xFFE3E3E3), RoundedCornerShape(12.dp))
-                            .padding(8.dp)
-                    ) {
-                        if (agentImage != null) {
-                            Image(
-                                bitmap = agentImage!!,
-                                contentDescription = null,
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = androidx.compose.ui.layout.ContentScale.Fit
-                            )
-                        } else {
-                            Text("Live screen will appear here…", color = Color.Gray)
-                        }
-                    }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
 
-                    Spacer(Modifier.width(12.dp))
-
-                    Column(Modifier.weight(0.45f)) {
-                        val progress = if (agentTotalSteps > 0) agentCompletedSteps.toFloat() / agentTotalSteps else 0f
-                        LinearProgressIndicator(progress = progress, modifier = Modifier.fillMaxWidth())
-                        Spacer(Modifier.height(8.dp))
-                        Text("Progress: $agentCompletedSteps / $agentTotalSteps")
-                        Spacer(Modifier.height(4.dp))
-                        Text(agentStatus ?: "", color = Color.Gray)
-                        Spacer(Modifier.height(12.dp))
-
-                        Text("Timeline", fontWeight = MaterialTheme.typography.h6.fontWeight)
-                        Spacer(Modifier.height(6.dp))
-                        Box(
-                            Modifier.fillMaxWidth().height(180.dp)
-                                .background(Color.White, RoundedCornerShape(8.dp))
-                                .border(1.dp, Color(0xFFE3E3E3), RoundedCornerShape(8.dp))
-                                .padding(8.dp)
+                        // --- Device preview (bigger) ---
+                        RightCard(
+                            modifier = Modifier.weight(0.60f).height(540.dp),
+                            pad = 8.dp
                         ) {
-                            if (agentTimeline.isEmpty()) {
-                                Text("Waiting for steps…", color = Color.Gray)
+                            if (agentImage != null) {
+                                Image(
+                                    bitmap = agentImage!!,
+                                    contentDescription = null,
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = androidx.compose.ui.layout.ContentScale.Fit
+                                )
                             } else {
-                                LazyColumn {
-                                    items(agentTimeline) { snap ->
-                                        val ok = if (snap.success) "✅" else "❌"
-                                        Text("$ok #${snap.stepIndex} ${snap.action} ${snap.targetHint ?: ""}")
+                                Text("Live screen will appear here…", color = Color.Gray)
+                                Spacer(Modifier.height(8.dp))
+                                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    Column(
+                                        modifier = Modifier.fillMaxSize(),
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.Center
+                                    ) {
+                                        KottieAnimation(
+                                            composition = composition,
+                                            modifier = Modifier.size(260.dp),
+                                            progress = { animationState.progress },
+                                            backgroundColor = Color.Transparent,
+                                            contentScale = ContentScale.Fit
+                                        )
+
+                                        Spacer(Modifier.height(18.dp))
+
+                                        if (playing) {
+                                            Text(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                textAlign = TextAlign.Center,
+                                                text = "Working on it...",
+                                                color = Color.Gray,
+                                                fontWeight = MaterialTheme.typography.body1.fontWeight
+                                            )
+                                        } else {
+                                            Text(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                textAlign = TextAlign.Center,
+                                                text = "Parsing done now you can run the agent",
+                                                color = Color.Gray,
+                                                fontWeight = MaterialTheme.typography.body1.fontWeight
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(Modifier.width(16.dp))
+
+                        // --- Right column: chips + timeline ---
+                        Column(Modifier.weight(0.40f)) {
+
+                            // chips row like the screenshot
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                ChipPill("Done", agentCompletedSteps, Color(0xFF4CAF50))
+                                Spacer(Modifier.width(8.dp))
+                                ChipPill("Total", agentTotalSteps, Color(0xFF2962FF))
+                                Spacer(Modifier.width(8.dp))
+                                ChipPill("Fail", agentTimeline.count { !it.success }, Color(0xFFFF5252))
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = if (agentTotalSteps > 0) "Done: $agentCompletedSteps/$agentTotalSteps steps OK"
+                                else (agentStatus ?: ""),
+                                color = Color.Gray
+                            )
+
+                            Spacer(Modifier.height(12.dp))
+                            Text("Timeline", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                            Spacer(Modifier.height(6.dp))
+
+                            RightCard(modifier = Modifier.height(260.dp), pad = 10.dp) {
+                                if (agentTimeline.isEmpty()) {
+                                    Text(
+                                        modifier = Modifier.fillMaxSize(),
+                                        text = "Waiting for steps…",
+                                        color = Color.Gray
+                                    )
+                                } else {
+                                    LazyColumn {
+                                        items(agentTimeline) { snap ->
+                                            TimelineItem(snap)
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                Spacer(Modifier.height(12.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Agent logs", fontWeight = MaterialTheme.typography.h6.fontWeight)
-                    Spacer(Modifier.weight(1f))
-                    AlphaButton(text = "Clear logs", modifier = Modifier.width(120.dp)) {
-                        agentLogs.clear()        // ← wipes the live log list
+                    Spacer(Modifier.height(16.dp))
+
+                    // --- Logs header row (buttons at right) ---
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Agent logs", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                        Spacer(Modifier.weight(1f))
+                        AlphaButton(modifier = Modifier.width(120.dp), text = "Copy all") {
+                            val sel = java.awt.datatransfer.StringSelection(agentLogs.joinToString("\n"))
+                            java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(sel, sel)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        AlphaButton(modifier = Modifier.width(120.dp), text = "Clear logs") {
+                            agentLogs.clear()
+                            agentTimeline = emptyList()
+                            agentCompletedSteps = 0
+                            agentTotalSteps = 0
+                            agentStatus = null
+                        }
                     }
-                }
-                Spacer(Modifier.height(6.dp))
-                Box(
-                    Modifier.fillMaxWidth().height(180.dp)
-                        .background(Color.White, RoundedCornerShape(8.dp))
-                        .border(1.dp, Color(0xFFE3E3E3), RoundedCornerShape(8.dp))
-                        .padding(8.dp)
-                ) {
-                    if (agentLogs.isEmpty()) {
-                        Text("Logs will appear here…", color = Color.Gray)
-                    } else {
-                        LazyColumn {
-                            items(agentLogs) { line ->
-                                Text(line, fontSize = TextUnit(12f, TextUnitType.Sp))
+                    Spacer(Modifier.height(6.dp))
+
+                    // --- Drag handle (thicker, centered) ---
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .height(18.dp)
+                            .background(Color(0xFF2A2A2A), RoundedCornerShape(topStart = 8.dp, topEnd = 8.dp))
+                            .border(1.dp, Color(0xFF3A3A3A), RoundedCornerShape(topStart = 8.dp, topEnd = 8.dp))
+                            .draggable(
+                                state = dragState,
+                                orientation = Orientation.Vertical
+                            )
+                    ) {
+                        Box(
+                            Modifier
+                                .align(Alignment.Center)
+                                .width(56.dp)
+                                .height(4.dp)
+                                .background(Color(0xFFBDBDBD), RoundedCornerShape(2.dp))
+                        )
+                    }
+
+// --- Dark logs panel (prepend + auto-scroll-to-top already in your code) ---
+                    Box(
+                        Modifier.fillMaxWidth().height(logHeight)
+                            .background(Color(0xFF1E1E1E), RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
+                            .border(1.dp, Color(0xFF3A3A3A), RoundedCornerShape(bottomStart = 8.dp, bottomEnd = 8.dp))
+                            .padding(10.dp)
+                    ) {
+                        if (agentLogs.isEmpty()) {
+                            Text("Logs will appear here…", color = Color.Gray)
+                        } else {
+                            SelectionContainer {
+                                LazyColumn(state = logListState) {
+                                    items(agentLogs) { line ->
+                                        Text(
+                                            util.UiHelper.styleLogLine(line),
+                                            fontSize = TextUnit(12f, TextUnitType.Sp)
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -542,48 +575,98 @@ fun AppUI() {
     }
 }
 
-@Preview
+/* ---------------- Small composables ---------------- */
+
 @Composable
-fun DeviceNotSelectedError(
-    onClick: () -> Unit
-) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Row(modifier = Modifier, verticalAlignment = Alignment.CenterVertically) {
-            Image(painter = painterResource("drawable/warning.svg"), contentDescription = null)
-            Spacer(modifier = Modifier.size(4.dp))
-            Column() {
-                Text(text = "No device selected!", fontWeight = MaterialTheme.typography.h6.fontWeight)
+private fun BrandCard() {
+    Box(
+        modifier = Modifier.fillMaxWidth()
+            .background(Accent, RoundedCornerShape(12.dp))
+            .padding(12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Image(
+                modifier = Modifier.size(56.dp),
+                painter = painterResource("drawable/app_icon.png"),
+                contentDescription = null,
+                colorFilter = ColorFilter.tint(Color.White)
+            )
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text("Alpha Automation", color = Color.White, fontWeight = MaterialTheme.typography.h6.fontWeight)
+                Spacer(Modifier.height(2.dp))
                 Text(
-                    text = "Please select device to proceed",
-                    fontWeight = MaterialTheme.typography.h1.fontWeight,
+                    "developer Shahbaz Ansari",
+                    color = Color.White.copy(alpha = 0.9f),
                     fontSize = TextUnit(12f, TextUnitType.Sp)
                 )
-                Spacer(modifier = Modifier.size(4.dp))
             }
         }
+    }
+}
 
-        Spacer(modifier = Modifier.size(8.dp))
+@Composable
+private fun SectionTitle(text: String) {
+    Text(text, fontWeight = MaterialTheme.typography.h6.fontWeight)
+}
 
-        AlphaButton(text = "Scan devices") {
-            onClick.invoke()
+@Composable
+private fun CardBox(
+    modifier: Modifier = Modifier,
+    pad: Dp = 12.dp,
+    content: @Composable () -> Unit
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(CardBG, RoundedCornerShape(12.dp))
+            .border(1.dp, Line, RoundedCornerShape(12.dp))
+            .padding(pad)
+    ) { content() }
+}
+
+@Composable
+private fun StatChip(label: String, value: Int, tint: Color) {
+    Box(
+        Modifier.background(tint.copy(alpha = .12f), RoundedCornerShape(999.dp))
+            .border(1.dp, tint.copy(alpha = .35f), RoundedCornerShape(999.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(8.dp).background(tint, RoundedCornerShape(999.dp)))
+            Spacer(Modifier.width(6.dp))
+            Text("$label: $value", color = Color(0xFF222222))
         }
+    }
+}
+
+
+@Preview
+@Composable
+fun DeviceNotSelectedError(onClick: () -> Unit) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Image(painter = painterResource("drawable/warning.svg"), contentDescription = null)
+            Spacer(Modifier.width(6.dp))
+            Column {
+                Text("No device selected!", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                Text("Please select device to proceed", fontSize = TextUnit(12f, TextUnitType.Sp))
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        AlphaButton(text = "Scan devices") { onClick.invoke() }
     }
 }
 
 @Preview
 @Composable
 fun DeviceSelected() {
-    Row(modifier = Modifier, verticalAlignment = Alignment.CenterVertically) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
         Image(painter = painterResource("drawable/device.svg"), contentDescription = null)
-        Spacer(modifier = Modifier.size(4.dp))
-        Column() {
-            Text(text = "Device selected!", fontWeight = MaterialTheme.typography.h6.fontWeight)
-            Text(
-                text = "You can proceed with UI Dump",
-                fontWeight = MaterialTheme.typography.h1.fontWeight,
-                fontSize = TextUnit(12f, TextUnitType.Sp)
-            )
-
+        Spacer(Modifier.width(6.dp))
+        Column {
+            Text("Device selected!", fontWeight = MaterialTheme.typography.h6.fontWeight)
+            Text("You can proceed with UI Dump", fontSize = TextUnit(12f, TextUnitType.Sp))
         }
     }
 }
@@ -591,35 +674,31 @@ fun DeviceSelected() {
 @OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun DeviceItem(deviceName: String, onDeviceSelected: (String) -> Unit) {
-    var isActive by remember {
-        mutableStateOf(false)
-    }
-    var isSelected by remember {
-        mutableStateOf(false)
-    }
-    Box(modifier = Modifier.fillMaxWidth()
-        .background(color = if (isSelected) Color(BLUE) else Color(0xFFFFFFFF), shape = RoundedCornerShape(8.dp))
-        .onPointerEvent(eventType = PointerEventType.Enter) {
-            isActive = true
-        }.onPointerEvent(eventType = PointerEventType.Exit) {
-            isActive = false
-        }.onPointerEvent(eventType = PointerEventType.Press) {
-            isSelected = true
-            onDeviceSelected.invoke(deviceName)
-        }) {
+    var isActive by remember { mutableStateOf(false) }
+    var isSelected by remember { mutableStateOf(false) }
 
-        Row(modifier = Modifier.fillMaxWidth()) {
+    Box(
+        modifier = Modifier.fillMaxWidth()
+            .background(color = if (isSelected) Color(BLUE) else Subtle, shape = RoundedCornerShape(8.dp))
+            .onPointerEvent(PointerEventType.Enter) { isActive = true }
+            .onPointerEvent(PointerEventType.Exit) { isActive = false }
+            .onPointerEvent(PointerEventType.Press) {
+                isSelected = true; onDeviceSelected.invoke(deviceName)
+            }
+    ) {
+        Row(Modifier.fillMaxWidth()) {
             Text(
                 modifier = Modifier.weight(0.8f).padding(8.dp),
                 text = deviceName,
                 fontSize = TextUnit(16f, TextUnitType.Sp),
-                color = Color.DarkGray
+                color = if (isSelected) Color.White else Color.DarkGray
             )
             AnimatedVisibility(isActive) {
                 Image(
                     painter = painterResource("drawable/arrow_right.svg"),
                     contentDescription = null,
-                    modifier = Modifier.padding(8.dp).size(24.dp)
+                    modifier = Modifier.padding(8.dp).size(24.dp),
+                    colorFilter = ColorFilter.tint(if (isSelected) Color.White else Color.DarkGray)
                 )
             }
         }
@@ -634,59 +713,52 @@ fun CaptureUiDump(
     onFlowFeatureNameChange: (String) -> Unit,
 ) {
     var isLoading by remember { mutableStateOf(false) }
-    Box(
-        modifier = Modifier.fillMaxWidth()
-            .background(color = Color(0xFFEDF3FF), shape = RoundedCornerShape(size = 12.dp)).padding(12.dp)
-    ) {
-        Column() {
-            var packageName by remember { mutableStateOf("com.shazdroid.messapp") }
-            var flowFeatureName by remember { mutableStateOf("Login") }
 
-            PackageInput(hint = "Package Name", onTextChange = { value ->
-                packageName = value
-                onPackageNameChange.invoke(value)
-            })
-            Spacer(modifier = Modifier.padding(8.dp))
-            AnimatedVisibility(packageName.isNotEmpty()) {
-                FlowInput(hint = "Feature Flow Name", onTextChange = {
-                    flowFeatureName = it
-                    onFlowFeatureNameChange.invoke(it)
-                })
+    CardBox {
+        Column {
+            var pkg by remember { mutableStateOf("com.shazdroid.messapp") }
+            var flow by remember { mutableStateOf("Login") }
+
+            PackageInput(hint = "Package Name") {
+                pkg = it; onPackageNameChange.invoke(it)
             }
-            Spacer(modifier = Modifier.padding(8.dp))
+            Spacer(Modifier.height(8.dp))
+            AnimatedVisibility(pkg.isNotEmpty()) {
+                FlowInput(hint = "Feature Flow Name") { name ->
+                    flow = name; onFlowFeatureNameChange.invoke(name)
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+
             AnimatedVisibility(isCaptureDone) {
                 isLoading = false
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Image(
-                        modifier = Modifier.size(24.dp),
                         painter = painterResource("drawable/success.svg"),
-                        contentDescription = null
+                        contentDescription = null,
+                        modifier = Modifier.size(24.dp)
                     )
-                    Spacer(modifier = Modifier.padding(4.dp))
-                    Row() {
+                    Spacer(Modifier.width(6.dp))
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            modifier = Modifier.weight(1f),
-                            text = "Captured UI Dump",
-                            fontWeight = MaterialTheme.typography.h6.fontWeight
+                            "Captured UI Dump",
+                            fontWeight = MaterialTheme.typography.h6.fontWeight,
+                            modifier = Modifier.weight(1f)
                         )
-
                         Image(
-                            modifier = Modifier
-                                .size(24.dp)
-                                .clickable {
-                                    onClick.invoke()
-                                }, painter = painterResource("drawable/restart.svg"), contentDescription = null
+                            painter = painterResource("drawable/restart.svg"),
+                            contentDescription = null,
+                            modifier = Modifier.size(24.dp).clickable { onClick.invoke() }
                         )
                     }
                 }
-                Spacer(modifier = Modifier.padding(4.dp))
+                Spacer(Modifier.height(4.dp))
             }
 
-            AnimatedVisibility(flowFeatureName.isNotEmpty()) {
+            AnimatedVisibility(flow.isNotEmpty()) {
                 AnimatedVisibility(isCaptureDone.not()) {
                     AlphaButton(isLoading = isLoading, text = "Capture UI Dump") {
-                        isLoading = true
-                        onClick.invoke()
+                        isLoading = true; onClick.invoke()
                     }
                 }
             }
@@ -698,11 +770,9 @@ fun CaptureUiDump(
 fun PackageInput(hint: String, onTextChange: (String) -> Unit) {
     val text = remember { mutableStateOf("") }
     AlphaInputText(
+        backgroundColor = Subtle,
         value = text.value,
-        onValueChange = { textValue ->
-            text.value = textValue
-            onTextChange.invoke(textValue)
-        },
+        onValueChange = { v -> text.value = v; onTextChange(v) },
         hint = hint
     )
 }
@@ -711,30 +781,24 @@ fun PackageInput(hint: String, onTextChange: (String) -> Unit) {
 fun FlowInput(hint: String, onTextChange: (String) -> Unit) {
     val text = remember { mutableStateOf("") }
     AlphaInputText(
+        backgroundColor = Subtle,
         value = text.value,
-        onValueChange = { textValue ->
-            text.value = textValue
-            onTextChange.invoke(textValue)
-        },
+        onValueChange = { v -> text.value = v; onTextChange(v) },
         hint = hint
     )
 }
-
 
 @Composable
 fun VerticalDivider(
     modifier: Modifier = Modifier,
     color: Color = Color.LightGray,
     thickness: Dp = 1.dp,
-    height: Dp = Dp.Unspecified, // Use fillMaxHeight if unspecified
+    height: Dp = Dp.Unspecified
 ) {
     Box(
         modifier = modifier
             .width(thickness)
-            .then(
-                if (height == Dp.Unspecified) Modifier.fillMaxHeight()
-                else Modifier.height(height)
-            )
+            .then(if (height == Dp.Unspecified) Modifier.fillMaxHeight() else Modifier.height(height))
             .background(color)
     )
 }
@@ -742,21 +806,14 @@ fun VerticalDivider(
 fun openPdfFromResources(resourcePath: String) {
     val inputStream = object {}.javaClass.classLoader.getResourceAsStream(resourcePath)
     if (inputStream != null) {
-        // Create a temp file
         val tempFile = File.createTempFile("documentation", ".pdf")
         tempFile.deleteOnExit()
-
-        // Write resource to temp file
-        FileOutputStream(tempFile).use { output ->
-            inputStream.copyTo(output)
-        }
-
-        // Open the PDF using default viewer
+        FileOutputStream(tempFile).use { output -> inputStream.copyTo(output) }
         Desktop.getDesktop().open(tempFile)
-    } else {
-        println("❌ PDF resource not found at $resourcePath")
-    }
+    } else println("❌ PDF resource not found at $resourcePath")
 }
+
+/* ---------------- Agent block ---------------- */
 
 @Composable
 fun AgentComponent(
@@ -766,7 +823,8 @@ fun AgentComponent(
     onStatus: (String) -> Unit,
     onLog: (String) -> Unit,
     onTimelineUpdate: (List<Snapshot>) -> Unit,
-    onRunState: (running: Boolean, totalSteps: Int) -> Unit
+    onRunState: (running: Boolean, totalSteps: Int) -> Unit,
+    isParsingTask: (Boolean) -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var nlTask by remember { mutableStateOf("") }
@@ -776,39 +834,39 @@ fun AgentComponent(
     var outputDir by remember { mutableStateOf("automation-output") }
     var isParsing by remember { mutableStateOf(false) }
     var isGenerating by remember { mutableStateOf(false) }
-
     val intentParser = remember { IntentParser() }
 
-    Box(
-        modifier = Modifier.fillMaxWidth()
-            .background(Color(0xFFEDF3FF), RoundedCornerShape(12.dp))
-            .padding(12.dp)
-    ) {
+    CardBox {
         Column {
-            Text("Agent (Natural Language)", fontWeight = MaterialTheme.typography.h6.fontWeight)
+            SectionTitle("Agent (Natural Language)")
             Spacer(Modifier.height(8.dp))
 
-            AlphaInputText(value = packageName, onValueChange = {}, hint = "App package")
+            AlphaInputText(backgroundColor = Subtle, value = packageName, onValueChange = {}, hint = "App package")
             Spacer(Modifier.height(8.dp))
-            AlphaInputText(value = appActivity, onValueChange = { appActivity = it }, hint = "Main activity")
-
+            AlphaInputText(
+                backgroundColor = Subtle,
+                value = appActivity,
+                onValueChange = { appActivity = it },
+                hint = "Main activity"
+            )
             Spacer(Modifier.height(12.dp))
+
             AlphaInputTextMultiline(
                 value = nlTask,
                 onValueChange = { nlTask = it },
                 hint = "Describe the task…",
-                backgroundColor = Color.White
+                backgroundColor = Subtle
             )
 
             Spacer(Modifier.height(12.dp))
-
             Row {
-                AlphaButton(text = "Parse Task", isLoading = isParsing, onClick = {
+                AlphaButton(text = "Parse Task", isLoading = isParsing) {
                     if (nlTask.isBlank()) {
+                        isParsingTask.invoke(false)
                         onStatus("Please enter a task."); return@AlphaButton
                     }
-                    onShowAgentView()
-                    isParsing = true; onStatus("Parsing task…")
+                    isParsingTask.invoke(true)
+                    onShowAgentView(); isParsing = true; onStatus("Parsing task…")
                     scope.launch(Dispatchers.IO) {
                         try {
                             val p = intentParser.parse(nlTask, packageName)
@@ -816,18 +874,19 @@ fun AgentComponent(
                             plan = fixed
                             onStatus("Parsed ${fixed.steps.size} steps.")
                             onLog("Parsed plan: ${fixed.steps.joinToString { "${it.index}:${it.type}" }}")
+                            isParsingTask.invoke(false)
                         } catch (e: Exception) {
-                            onStatus("Parse error: ${e.message}")
-                            onLog("Parse error: ${e}")
+                            onStatus("Parse error: ${e.message}"); onLog("Parse error: $e")
                         } finally {
                             isParsing = false
                         }
                     }
-                })
+                }
             }
+
             Spacer(Modifier.height(8.dp))
             Row {
-                AlphaButton(text = "Run agent", onClick = {
+                AlphaButton(text = "Run agent") {
                     if (selectedDevice.isBlank()) { onStatus("Select a device first."); onLog("Preflight: no device"); return@AlphaButton }
                     if (!util.AppiumHealth.isReachable()) { onStatus("❌ Appium not reachable at 127.0.0.1:4723"); onLog("Preflight: appium down"); return@AlphaButton }
                     if (!adb.AdbExecutor.isPackageInstalled(selectedDevice, packageName)) { onStatus("❌ Package $packageName not installed"); onLog("Preflight: package missing"); return@AlphaButton }
@@ -856,69 +915,65 @@ fun AgentComponent(
                                     onLog("Step ${snap.stepIndex} ${snap.action} -> ${if (snap.success) "OK" else "FAIL"}")
                                     onLog("  xml: ${snap.pageSourcePath}")
                                     onLog("  png: ${snap.screenshotPath}")
-                                }
-                                ,
+                                },
                                 onLog = onLog,
                                 onStatus = onStatus
                             )
-
                             onStatus("Done: ${result.count { it.success }}/${result.size} steps OK")
                             driver.quit()
                         } catch (e: Exception) {
-                            onStatus("❌ Agent error: ${e.message}")
-                            onLog("Agent error: $e")
+                            onStatus("❌ Agent error: ${e.message}"); onLog("Agent error: $e")
                         } finally {
                             onRunState(false, p.steps.size)
                         }
                     }
-                })
+                }
 
                 Spacer(Modifier.width(8.dp))
-
-                AlphaButton(text = "Generate with AI", onClick = {
+                AlphaButton(text = "Generate with AI") {
                     val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
                     if (timeline.isEmpty()) { onStatus("Run the agent first."); return@AlphaButton }
                     onShowAgentView(); onStatus("Generating scripts with AI…")
                     scope.launch(Dispatchers.IO) {
-                        try { generator.LlmScriptGenerator(OllamaClient, java.io.File(outputDir)).generate(p, timeline)
-                            onStatus("Scripts written to $outputDir") }
-                        catch (e: Exception) { onStatus("Generation error: ${e.message}"); onLog("Generation error: $e") }
+                        try {
+                            LlmScriptGenerator(OllamaClient, File(outputDir)).generate(p, timeline)
+                            onStatus("Scripts written to $outputDir")
+                        } catch (e: Exception) {
+                            onStatus("Generation error: ${e.message}"); onLog("Generation error: $e")
+                        }
                     }
-                })
+                }
             }
 
             Spacer(Modifier.height(8.dp))
-
             Row {
-                AlphaButton(text = "Generate scripts", isLoading = isGenerating, onClick = {
+                AlphaButton(text = "Generate scripts", isLoading = isGenerating) {
                     val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
                     if (timeline.isEmpty()) {
                         onStatus("Run the agent first."); return@AlphaButton
                     }
-                    onShowAgentView()
-                    onStatus("Generating scripts with AI…")
+                    onShowAgentView(); onStatus("Generating scripts with AI…")
                     isGenerating = true
                     scope.launch(Dispatchers.IO) {
                         try {
-                            LlmScriptGenerator(OllamaClient, File(outputDir))
-                                .generate(p, timeline)
+                            LlmScriptGenerator(OllamaClient, File(outputDir)).generate(p, timeline)
                             onStatus("✅ Scripts written to $outputDir")
                         } catch (e: Exception) {
-                            onStatus("Generation error: ${e.message}")
-                            onLog("Generation error: $e")
+                            onStatus("Generation error: ${e.message}"); onLog("Generation error: $e")
                         } finally {
                             isGenerating = false
                         }
                     }
-                })
+                }
             }
 
             Spacer(Modifier.height(8.dp))
-            AlphaInputText(value = outputDir, onValueChange = { outputDir = it }, hint = "Output folder")
+            AlphaInputText(
+                backgroundColor = Subtle,
+                value = outputDir,
+                onValueChange = { outputDir = it },
+                hint = "Output folder"
+            )
         }
     }
 }
-
-
-
-
