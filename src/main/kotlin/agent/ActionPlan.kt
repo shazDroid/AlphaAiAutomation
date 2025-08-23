@@ -17,4 +17,4 @@ data class PlanStep(
     val meta: Map<String, String> = emptyMap()
 )
 
-enum class StepType { LAUNCH_APP, TAP, INPUT_TEXT, SCROLL_TO, WAIT_TEXT, ASSERT_TEXT, BACK, SLEEP }
+enum class StepType { LAUNCH_APP, TAP, INPUT_TEXT, SCROLL_TO, WAIT_TEXT, ASSERT_TEXT, BACK, SLEEP,WAIT_OTP,SLIDE  }

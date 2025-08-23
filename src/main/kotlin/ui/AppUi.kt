@@ -846,10 +846,10 @@ fun AgentComponent(
                                 appPackage = packageName,
                                 appActivity = appActivity
                             )
-                            val resolver = agent.LocatorResolver(driver) { msg -> onLog(msg) }
-                            val store = agent.SnapshotStore(driver, java.io.File("runs/${System.currentTimeMillis()}"))
+                            val resolver = LocatorResolver(driver, onLog)
+                            val store = SnapshotStore(driver, File("runs/${System.currentTimeMillis()}"))
 
-                            val result = agent.AgentRunner(driver, resolver, store).run(
+                            val result = AgentRunner(driver, resolver, store).run(
                                 plan = p,
                                 onStep = { snap ->
                                     timeline = timeline + snap
@@ -884,6 +884,32 @@ fun AgentComponent(
                         try { generator.LlmScriptGenerator(OllamaClient, java.io.File(outputDir)).generate(p, timeline)
                             onStatus("Scripts written to $outputDir") }
                         catch (e: Exception) { onStatus("Generation error: ${e.message}"); onLog("Generation error: $e") }
+                    }
+                })
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Row {
+                AlphaButton(text = "Generate scripts", isLoading = isGenerating, onClick = {
+                    val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
+                    if (timeline.isEmpty()) {
+                        onStatus("Run the agent first."); return@AlphaButton
+                    }
+                    onShowAgentView()
+                    onStatus("Generating scripts with AI…")
+                    isGenerating = true
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            LlmScriptGenerator(OllamaClient, File(outputDir))
+                                .generate(p, timeline)
+                            onStatus("✅ Scripts written to $outputDir")
+                        } catch (e: Exception) {
+                            onStatus("Generation error: ${e.message}")
+                            onLog("Generation error: $e")
+                        } finally {
+                            isGenerating = false
+                        }
                     }
                 })
             }

@@ -25,7 +25,7 @@ object OllamaClient {
         println("Request body: \n$prompt")
         val mediaType = "application/json; charset=utf-8".toMediaType()
         val payload = mapOf(
-            "model" to "deepseek-coder:6.7b",
+            "model" to "deepseek-r1:8b",
             "messages" to listOf(
                 mapOf("role" to "system", "content" to "You are a test automation code generator."),
                 mapOf("role" to "user", "content" to prompt)
@@ -83,8 +83,11 @@ object OllamaClient {
             "temperature" to 0.0,
             "format" to "json"
         )
-        val body = mapper.writeValueAsString(payload).toRequestBody(mediaType)
+        val reqJson = mapper.writeValueAsString(payload)
+        println("🟦 [Ollama] REQUEST JSON (${reqJson.length} chars)")
+        println(reqJson.take(4000) + if (reqJson.length > 4000) " ...[truncated]" else "")
 
+        val body = reqJson.toRequestBody(mediaType)
         val request = Request.Builder()
             .url("http://localhost:11434/api/chat")
             .post(body)
@@ -92,10 +95,15 @@ object OllamaClient {
 
         client.newCall(request).execute().use { resp ->
             val raw = resp.body?.string().orEmpty().trim()
+            println("🟩 [Ollama] RAW RESPONSE (${raw.length} chars)")
+            println(raw.take(4000) + if (raw.length > 4000) " ...[truncated]" else "")
             val node = mapper.readTree(raw)
             val content = node.path("message").path("content").asText("")
-            return content.ifBlank { raw }
+            if (content.isBlank()) {
+                println("🟨 [Ollama] WARNING: 'message.content' empty, returning RAW response")
+                return raw
+            }
+            return content
         }
     }
-
 }
