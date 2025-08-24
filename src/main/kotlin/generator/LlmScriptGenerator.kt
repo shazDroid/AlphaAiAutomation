@@ -52,7 +52,7 @@ class LlmScriptGenerator(
             Strategy.ID          -> "id=$value"               // id=com.pkg:id/foo
             Strategy.DESC        -> "~$value"                 // ~content-desc
             Strategy.UIAUTOMATOR -> "android=$value"          // android=new UiSelector()...
-            else                 -> null                      // ignore unknowns
+            else -> null
         }
 
         val recs: List<Rec> = timeline.mapNotNull { snap ->
@@ -72,10 +72,10 @@ class LlmScriptGenerator(
 
         val inputSelectors   = lastByType(setOf(StepType.INPUT_TEXT))
         val tapSelectors     = lastByType(setOf(StepType.TAP))
-        val assertSelectors  = lastByType(setOf(StepType.WAIT_TEXT, StepType.CHECK, StepType.ASSERT_TEXT))
+        val assertSelectors0 = lastByType(setOf(StepType.WAIT_TEXT, StepType.CHECK, StepType.ASSERT_TEXT))
         val lockedSelectors  = recs.groupBy { it.hint }.mapValues { (_, g) -> g.maxBy { it.step }.sel }
 
-        // All hints referenced by steps must have some recorded selector
+        // ---- Ensure referenced hints (from positive plan) exist
         val requiredHints = plan.steps
             .filter { it.type in setOf(StepType.INPUT_TEXT, StepType.TAP, StepType.WAIT_TEXT, StepType.CHECK, StepType.ASSERT_TEXT) }
             .mapNotNull { it.targetHint?.trim() }
@@ -86,13 +86,25 @@ class LlmScriptGenerator(
             for (h in requiredHints) {
                 val hasAny = inputSelectors.containsKey(h) ||
                         tapSelectors.containsKey(h) ||
-                        assertSelectors.containsKey(h) ||
+                        assertSelectors0.containsKey(h) ||
                         lockedSelectors.containsKey(h)
                 if (!hasAny) add(h)
             }
         }
         require(missing.isEmpty()) {
             "Missing recorded selector for: $missing. Ensure the agent stores the selector actually used for those interactions."
+        }
+
+        // ---- Negative -----
+        val errorUnionXPath =
+            "//*[contains(@resource-id,'error') or contains(@resource-id,'textViewHelperError') or " +
+                    "contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'error') or " +
+                    "contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'invalid') or " +
+                    "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'error') or " +
+                    "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'invalid')]"
+
+        val assertSelectors = LinkedHashMap(assertSelectors0).apply {
+            putIfAbsent("error", errorUnionXPath)
         }
 
         // Serialize maps for LLM context
@@ -108,7 +120,7 @@ class LlmScriptGenerator(
             )
         )
 
-        // ------ System instruction ----------
+        // ------ System instruction: single feature with BOTH positive & negatives ----------
         val systemRules = """
             You are a code generator for a TypeScript + WebdriverIO + Cucumber + Appium (Android) repository.
 
@@ -121,16 +133,16 @@ class LlmScriptGenerator(
             SELECTOR SOURCES (authoritative):
             - INPUT_SELECTORS.bestByHint: exact selector strings used for INPUT_TEXT (typing).
             - TAP_SELECTORS.bestByHint:   exact selector strings used for taps.
-            - ASSERT_SELECTORS.bestByHint: exact selector strings used for visibility/assert waits.
+            - ASSERT_SELECTORS.bestByHint: exact selector strings used for visibility/assert waits (includes a generic "error" XPath).
             - LOCKED_SELECTORS.bestByHint: last successful selector for any action (fallback only if the role-specific map lacks the hint).
 
             CRITICAL RULES:
             - Use the selector string **verbatim**. Do NOT transform or invent.
             - Page objects must embed selectors directly in WDIO `$()`:
-                * If selector starts with "//"     -> return $('//…')      // XPath
-                * If selector starts with "id="    -> return $('id=…')      // resource-id
+                * If selector starts with "//"       -> return $('//…')       // XPath
+                * If selector starts with "id="      -> return $('id=…')      // resource-id
                 * If selector starts with "android=" -> return $('android=…') // UiAutomator
-                * If selector starts with "~"      -> return $('~…')        // content-desc
+                * If selector starts with "~"        -> return $('~…')        // content-desc
             - Do NOT use UiSelectorBuilderAndroid or any builder/regex helper.
             - For each getter:
                 * If its hint is in inputHints, use INPUT_SELECTORS.bestByHint[hint]
@@ -141,23 +153,26 @@ class LlmScriptGenerator(
             FILE STYLE (match existing project):
             1) pageobjects/base/BaseDashboardPage.ts
                - TypeScript; export default abstract class BaseDashboardPage
-               - Declare getters/methods actually used by the scenario (txtUsername, txtPassword, btnLogin, tabServices, banner, etc).
+               - Declare getters/methods actually used by the scenarios (txtUsername, txtPassword, btnLogin, tabServices, banner, lblError, etc).
 
             2) pageobjects/android/AndroidDashboardPage.ts
                - TypeScript; class AndroidDashboardPage extends BaseDashboardPage
                - Each getter returns $('<selector>') with the exact selector from the correct map (see above).
+               - Example: public abstract get banner(): ChainablePromiseElement<WebdriverIO.Element>;
 
             3) step-definitions/dashboard/dashboard.steps.ts
                - WDIO Cucumber with async/await; use only page-object getters/methods.
 
-            4) features/services/<slug>.feature
-               - Gherkin; Scenario Outline & Examples.
-               e.g Feature: Action Plan
-
-                    Scenario: Action Plan
-                    Given I login with <"username"> and <"password">
-                    | username | password | 
-                    | kycuser2 | Test@112 |
+            4) features/services/<slug>.feature  (single file must contain BOTH positive and negative)
+               - Include:
+                 (a) One **positive** scenario (or outline) derived from SUMMARY_JSON order.
+                 (b) One **Negative Scenario Outline** named "Invalid login attempts" (or similar).
+                     • Use ONLY these hints in steps: "username", "password", "LOGIN", "error".
+                     • After tapping LOGIN, assert the generic "error" via ASSERT_SELECTORS.bestByHint["error"].
+                     • Provide a comprehensive Examples table (at least 8–12 rows) covering: empty username, empty password,
+                       both empty, wrong username, wrong password, password too short, username with spaces,
+                       password with spaces, username with invalid format, password max-length overflow, etc.
+                     • Do NOT introduce any new hints/selectors beyond the four listed.
 
             Begin your reply with: ### BASE_PAGE_START
             No prose/explanations outside the four sections.
@@ -202,7 +217,7 @@ class LlmScriptGenerator(
             appendLine()
             appendLine("### FEATURE_FILE_START")
             appendLine("```gherkin")
-            appendLine("// features/services/<slug>.feature (slug from the title)")
+            appendLine("// features/services/<slug>.feature (single file: includes positive AND a negative Scenario Outline as specified)")
             appendLine("```")
             appendLine("### FEATURE_FILE_END")
         }
@@ -247,14 +262,13 @@ class LlmScriptGenerator(
         require(!baseBlock.isNullOrBlank())    { "LLM failed to produce BaseDashboardPage" }
         require(!androidBlock.isNullOrBlank()) { "LLM failed to produce AndroidDashboardPage" }
         require(!stepsBlock.isNullOrBlank())   { "LLM failed to produce step definitions" }
-        require(!featureBlock.isNullOrBlank()) { "LLM failed to produce feature file" }
+        require(!featureBlock.isNullOrBlank()) { "LLM failed to produce feature file (with positive + negative)" }
 
         // ------ Validate: no builder, no prose, selectors embedded via $() --------
         val androidCode = stripFences(androidBlock!!)
         require(!Regex("""UiSelectorBuilderAndroid""").containsMatchIn(androidCode)) {
             "Generated page must not use UiSelectorBuilderAndroid."
         }
-
         require(Regex("""\$\(['"]""").containsMatchIn(androidCode)) {
             "Generated page did not embed any WDIO $('…') selectors."
         }
