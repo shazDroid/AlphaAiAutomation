@@ -3,8 +3,6 @@ package ui
 import CodeBlock
 import KottieAnimation
 import adb.AdbExecutor
-import adb.UiDumpParser
-import adb.UiDumpParser.cleanUiDumpXml
 import agent.ActionPlan
 import agent.AgentRunner
 import agent.IntentParser
@@ -51,20 +49,19 @@ import kotlinx.coroutines.launch
 import kottieComposition.KottieCompositionSpec
 import kottieComposition.animateKottieCompositionAsState
 import kottieComposition.rememberKottieComposition
+import model.GenState
 import model.UiElement
 import ui.component.AlphaButton
 import ui.component.AlphaInputText
 import ui.component.AlphaInputTextMultiline
 import ui.component.AlphaTabRow
 import ui.component.ChipPill
+import ui.component.GenerationStatusCard
 import ui.component.RightCard
 import ui.component.TimelineItem
 import ui.theme.BLUE
-import util.TargetMapper
-import util.extractCodeBetweenMarkers
 import utils.KottieConstants
 import yaml.TestFlow
-import yaml.YamlFlowLoader
 import java.awt.Desktop
 import java.io.File
 import java.io.FileOutputStream
@@ -118,6 +115,8 @@ fun AppUI() {
     var agentCompletedSteps by remember { mutableStateOf(0) }
     var isAgentRunning by remember { mutableStateOf(false) }
     var showAgentView by remember { mutableStateOf(false) }
+    var genState by remember { mutableStateOf(GenState()) }
+
 
 
     // live screen
@@ -185,6 +184,8 @@ fun AppUI() {
 
                 SectionTitle("Devices")
 
+                Spacer(Modifier.height(8.dp))
+
                 CardBox {
                     Column {
                         if (selectedDevice.isEmpty()) DeviceNotSelectedError {
@@ -214,55 +215,57 @@ fun AppUI() {
                 }
 
                 Spacer(Modifier.height(16.dp))
-                AnimatedVisibility(selectedDevice.isNotEmpty()) {
-                    Column {
-                        SectionTitle("YAML editor")
-                        Spacer(Modifier.height(8.dp))
-                        AlphaInputTextMultiline(
-                            value = yamlContent,
-                            onValueChange = { yamlContent = it },
-                            hint = "Enter YAML flow here",
-                            backgroundColor = Subtle
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        AnimatedVisibility(yamlContent.isNotEmpty()) {
-                            CaptureUiDump(
-                                isCaptureDone = isCapturedDone,
-                                onClick = {
-                                    isCapturedDone = false
-                                    scope.launch(Dispatchers.IO) {
-                                        // intro loop visual
-                                        playing = true
-                                        // parse flow
-                                        if (yamlContent.isNotBlank()) {
-                                            runCatching {
-                                                parsedFlow = YamlFlowLoader.loadFlowFromString(yamlContent)
-                                            }
-                                        }
-                                        // capture & enrich
-                                        val xml = UiDumpParser.getUiDumpXml(selectedDevice)
-                                        val cleanedXml = cleanUiDumpXml(xml)
-                                        val parsed = UiDumpParser.parseUiDump(cleanedXml).toMutableList()
-                                        parsedFlow?.flow?.forEach { action ->
-                                            if (action.action == "input_text" && !action.target_text.isNullOrEmpty()) {
-                                                UiDumpParser.findEditTextForLabel(cleanedXml, action.target_text)?.let {
-                                                    parsed.add(it)
-                                                }
-                                            }
-                                        }
-                                        uiElements = parsed
-                                        isCapturedDone = true
-                                        playing = false
-                                    }
-                                },
-                                onPackageNameChange = { packageName = it },
-                                onFlowFeatureNameChange = { featureFlowName = it }
-                            )
-                        }
-                    }
-                }
+                /*  AnimatedVisibility(selectedDevice.isNotEmpty() && false) {
+                      Column {
+                          SectionTitle("YAML editor")
+                          Spacer(Modifier.height(8.dp))
+                          AlphaInputTextMultiline(
+                              value = yamlContent,
+                              onValueChange = { yamlContent = it },
+                              hint = "Enter YAML flow here",
+                              backgroundColor = Subtle
+                          )
+                          Spacer(Modifier.height(8.dp))
+                          AnimatedVisibility(yamlContent.isNotEmpty()) {
+                              CaptureUiDump(
+                                  isCaptureDone = isCapturedDone,
+                                  onClick = {
+                                      isCapturedDone = false
+                                      scope.launch(Dispatchers.IO) {
+                                          // intro loop visual
+                                          playing = true
+                                          // parse flow
+                                          if (yamlContent.isNotBlank()) {
+                                              runCatching {
+                                                  parsedFlow = YamlFlowLoader.loadFlowFromString(yamlContent)
+                                              }
+                                          }
+                                          // capture & enrich
+                                          val xml = UiDumpParser.getUiDumpXml(selectedDevice)
+                                          val cleanedXml = cleanUiDumpXml(xml)
+                                          val parsed = UiDumpParser.parseUiDump(cleanedXml).toMutableList()
+                                          parsedFlow?.flow?.forEach { action ->
+                                              if (action.action == "input_text" && !action.target_text.isNullOrEmpty()) {
+                                                  UiDumpParser.findEditTextForLabel(cleanedXml, action.target_text)?.let {
+                                                      parsed.add(it)
+                                                  }
+                                              }
+                                          }
+                                          uiElements = parsed
+                                          isCapturedDone = true
+                                          playing = false
+                                      }
+                                  },
+                                  onPackageNameChange = { packageName = it },
+                                  onFlowFeatureNameChange = { featureFlowName = it }
+                              )
+                          }
+                      }
+                  }*/
 
                 Spacer(Modifier.height(16.dp))
+
+                // --- Script generation UI state ---
                 AgentComponent(
                     selectedDevice = selectedDevice,
                     packageName = packageName,
@@ -282,59 +285,80 @@ fun AppUI() {
                     },
                     isParsingTask = {
                         playing = it; showAnimation = it
+                    },
+                    onGenReset = { genState = GenState() },
+                    onGenStart = { total ->
+                        genState = GenState(visible = true, isGenerating = true, total = total, message = "Starting…")
+                    },
+                    onGenProgress = { step, total, msg ->
+                        genState = genState.copy(
+                            visible = true,
+                            isGenerating = true,
+                            step = step,
+                            total = total,
+                            message = msg,
+                            error = null
+                        )
+                    },
+                    onGenDone = { dir ->
+                        genState =
+                            genState.copy(isGenerating = false, step = genState.total, message = "Done", outDir = dir)
+                    },
+                    onGenError = { msg ->
+                        genState = genState.copy(visible = true, isGenerating = false, error = msg, message = "Failed")
                     }
                 )
 
                 Spacer(Modifier.height(16.dp))
-                AlphaButton(isLoading = isLoading, text = "Generate with AI") {
-                    if (yamlContent.isBlank()) {
-                        baseClassOutput = "Please enter YAML flow first."
-                        return@AlphaButton
-                    }
-                    showAnimation = true; playing = true
-                    scope.launch(Dispatchers.IO) {
-                        isLoading = true
-                        try {
-                            val full = StringBuilder()
-                            val flow = YamlFlowLoader.loadFlowFromString(yamlContent)
-                            val (updated, actionable) = TargetMapper.mapTargets(flow, uiElements)
-                            parsedFlow = flow
-                            baseClassOutput = ""; platformClassOutput = ""; stepDefinitionsOutput =
-                                ""; featureFileOutput = ""
-                            val prompt = util.PromptBuilder.buildPrompt(featureFlowName, updated, actionable)
+                /* AlphaButton(isLoading = isLoading, text = "Generate with AI") {
+                     if (yamlContent.isBlank()) {
+                         baseClassOutput = "Please enter YAML flow first."
+                         return@AlphaButton
+                     }
+                     showAnimation = true; playing = true
+                     scope.launch(Dispatchers.IO) {
+                         isLoading = true
+                         try {
+                             val full = StringBuilder()
+                             val flow = YamlFlowLoader.loadFlowFromString(yamlContent)
+                             val (updated, actionable) = TargetMapper.mapTargets(flow, uiElements)
+                             parsedFlow = flow
+                             baseClassOutput = ""; platformClassOutput = ""; stepDefinitionsOutput =
+                                 ""; featureFileOutput = ""
+                             val prompt = util.PromptBuilder.buildPrompt(featureFlowName, updated, actionable)
 
-                            OllamaClient.sendPromptStreaming(
-                                prompt,
-                                onChunk = { chunk ->
-                                    val t = chunk.trim()
-                                    if (t.isNotEmpty()) {
-                                        runCatching {
-                                            val node = mapper.readTree(t)
-                                            val content = node["message"]?.get("content")?.asText() ?: ""
-                                            full.append(content)
-                                        }
-                                    }
-                                },
-                                onComplete = {
-                                    playing = false; showAnimation = false; isLoading = false
-                                    val out = full.toString()
-                                    baseClassOutput =
-                                        extractCodeBetweenMarkers(out, "BASE_CLASS_START", "BASE_CLASS_END")
-                                    platformClassOutput =
-                                        extractCodeBetweenMarkers(out, "PLATFORM_CLASS_START", "PLATFORM_CLASS_END")
-                                    stepDefinitionsOutput =
-                                        extractCodeBetweenMarkers(out, "STEP_DEFS_START", "STEP_DEFS_END")
-                                    featureFileOutput =
-                                        extractCodeBetweenMarkers(out, "FEATURE_FILE_START", "FEATURE_FILE_END")
-                                }
-                            )
-                        } catch (e: Exception) {
-                            println("Error: ${e.message}")
-                        } finally {
-                            isLoading = false
-                        }
-                    }
-                }
+                             OllamaClient.sendPromptStreaming(
+                                 prompt,
+                                 onChunk = { chunk ->
+                                     val t = chunk.trim()
+                                     if (t.isNotEmpty()) {
+                                         runCatching {
+                                             val node = mapper.readTree(t)
+                                             val content = node["message"]?.get("content")?.asText() ?: ""
+                                             full.append(content)
+                                         }
+                                     }
+                                 },
+                                 onComplete = {
+                                     playing = false; showAnimation = false; isLoading = false
+                                     val out = full.toString()
+                                     baseClassOutput =
+                                         extractCodeBetweenMarkers(out, "BASE_CLASS_START", "BASE_CLASS_END")
+                                     platformClassOutput =
+                                         extractCodeBetweenMarkers(out, "PLATFORM_CLASS_START", "PLATFORM_CLASS_END")
+                                     stepDefinitionsOutput =
+                                         extractCodeBetweenMarkers(out, "STEP_DEFS_START", "STEP_DEFS_END")
+                                     featureFileOutput =
+                                         extractCodeBetweenMarkers(out, "FEATURE_FILE_START", "FEATURE_FILE_END")
+                                 }
+                             )
+                         } catch (e: Exception) {
+                             println("Error: ${e.message}")
+                         } finally {
+                             isLoading = false
+                         }
+                     }
+                 }*/
             }
 
             VerticalDivider(modifier = Modifier.padding(vertical = 24.dp), color = Line)
@@ -399,7 +423,6 @@ fun AppUI() {
                     Text("Agent run", fontWeight = MaterialTheme.typography.h6.fontWeight)
                     Spacer(Modifier.height(8.dp))
 
-// thin accent bar like the mock
                     LinearProgressIndicator(
                         progress = if (agentTotalSteps > 0) agentCompletedSteps.toFloat() / agentTotalSteps else 0f,
                         modifier = Modifier.fillMaxWidth(),
@@ -445,7 +468,7 @@ fun AppUI() {
                                             Text(
                                                 modifier = Modifier.fillMaxWidth(),
                                                 textAlign = TextAlign.Center,
-                                                text = "Working on it...",
+                                                text = "Parsing tasks\nWorking on it...",
                                                 color = Color.Gray,
                                                 fontWeight = MaterialTheme.typography.body1.fontWeight
                                             )
@@ -453,7 +476,7 @@ fun AppUI() {
                                             Text(
                                                 modifier = Modifier.fillMaxWidth(),
                                                 textAlign = TextAlign.Center,
-                                                text = "Parsing done now you can run the agent",
+                                                text = "Parsing Task\nDone now you can run the agent",
                                                 color = Color.Gray,
                                                 fontWeight = MaterialTheme.typography.body1.fontWeight
                                             )
@@ -501,6 +524,20 @@ fun AppUI() {
                                         }
                                     }
                                 }
+                            }
+
+                            Spacer(Modifier.height(8.dp))
+
+                            if (genState.visible) {
+                                Spacer(Modifier.height(8.dp))
+                                GenerationStatusCard(
+                                    isGenerating = genState.isGenerating,
+                                    step = genState.step,
+                                    total = genState.total,
+                                    message = genState.message,
+                                    error = genState.error,
+                                    outDir = genState.outDir
+                                )
                             }
                         }
                     }
@@ -666,7 +703,7 @@ fun DeviceSelected() {
         Spacer(Modifier.width(6.dp))
         Column {
             Text("Device selected!", fontWeight = MaterialTheme.typography.h6.fontWeight)
-            Text("You can proceed with UI Dump", fontSize = TextUnit(12f, TextUnitType.Sp))
+            Text("You can proceed now", fontSize = TextUnit(12f, TextUnitType.Sp))
         }
     }
 }
@@ -824,7 +861,12 @@ fun AgentComponent(
     onLog: (String) -> Unit,
     onTimelineUpdate: (List<Snapshot>) -> Unit,
     onRunState: (running: Boolean, totalSteps: Int) -> Unit,
-    isParsingTask: (Boolean) -> Unit
+    isParsingTask: (Boolean) -> Unit,
+    onGenReset: () -> Unit,
+    onGenStart: (total: Int) -> Unit,
+    onGenProgress: (step: Int, total: Int, msg: String) -> Unit,
+    onGenDone: (outDir: File) -> Unit,
+    onGenError: (msg: String) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     var nlTask by remember { mutableStateOf("") }
@@ -946,25 +988,37 @@ fun AgentComponent(
             }
 
             Spacer(Modifier.height(8.dp))
+
             Row {
-                AlphaButton(text = "Generate scripts", isLoading = isGenerating) {
+                AlphaButton(text = "Generate scripts", isLoading = isGenerating, onClick = {
                     val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
                     if (timeline.isEmpty()) {
                         onStatus("Run the agent first."); return@AlphaButton
                     }
-                    onShowAgentView(); onStatus("Generating scripts with AI…")
+
+                    onShowAgentView()
+                    onStatus("Generating scripts with AI…")
+                    onGenReset()
+                    onGenStart(6)
                     isGenerating = true
+
                     scope.launch(Dispatchers.IO) {
                         try {
-                            LlmScriptGenerator(OllamaClient, File(outputDir)).generate(p, timeline)
-                            onStatus("✅ Scripts written to $outputDir")
+                            val out = LlmScriptGenerator(OllamaClient, File(outputDir))
+                                .generate(p, timeline) { step, total, msg ->
+                                    onGenProgress(step, total, msg)
+                                }
+                            onGenDone(out)
+                            onStatus("✅ Scripts written to ${out.absolutePath}")
                         } catch (e: Exception) {
-                            onStatus("Generation error: ${e.message}"); onLog("Generation error: $e")
+                            onGenError(e.message.toString())
+                            onStatus("Generation error: ${e.message}")
+                            onLog("Generation error: $e")
                         } finally {
                             isGenerating = false
                         }
                     }
-                }
+                })
             }
 
             Spacer(Modifier.height(8.dp))

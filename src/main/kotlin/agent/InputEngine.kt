@@ -5,12 +5,12 @@ import io.appium.java_client.android.AndroidDriver
 import io.appium.java_client.android.nativekey.AndroidKey
 import io.appium.java_client.android.nativekey.KeyEvent
 import org.openqa.selenium.JavascriptExecutor
-import org.openqa.selenium.remote.RemoteWebElement
+import org.openqa.selenium.interactions.Pause
 import org.openqa.selenium.interactions.PointerInput
 import org.openqa.selenium.interactions.PointerInput.Origin
 import org.openqa.selenium.interactions.Sequence
+import org.openqa.selenium.remote.RemoteWebElement
 import java.time.Duration
-import org.openqa.selenium.interactions.Pause
 
 object InputEngine {
 

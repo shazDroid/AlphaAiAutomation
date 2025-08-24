@@ -1,109 +1,164 @@
 package ui
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.jsonMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import java.io.IOException
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
+
 object OllamaClient {
+
     private val client = OkHttpClient.Builder()
-        .connectTimeout(60, TimeUnit.SECONDS)
-        .writeTimeout(60, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
+        .connectTimeout(0, TimeUnit.MILLISECONDS)
+        .writeTimeout(0, TimeUnit.MILLISECONDS)
+        .readTimeout(0, TimeUnit.MILLISECONDS)
+        .callTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
-
-
     private val mapper = ObjectMapper().registerKotlinModule()
+    private val mediaType = "application/json; charset=utf-8".toMediaType()
 
-    fun sendPromptStreaming(prompt: String, onChunk: (String) -> Unit, onComplete: () -> Unit) {
-        println("Request body: \n$prompt")
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val payload = mapOf(
-            "model" to "deepseek-r1:8b",
-            "messages" to listOf(
-                mapOf("role" to "system", "content" to "You are a test automation code generator."),
-                mapOf("role" to "user", "content" to prompt)
-            ),
-            "stream" to false,
-            "temperature" to 0.3
+    val apiKey = "AIzaSyBAB1n3XuO7Ra1wfrZNXPTWJRigDNvPtbE"
+
+    // --- Public APIs --------------------------------------------------------
+
+    fun completeRawBlocking(
+        system: String,
+        user: String,
+        model: String = "gemini-2.0-flash",
+        temperature: Double = 0.0
+    ): String {
+        val url = endpoint(model, apiKey)
+        val payload = buildGeminiPayload(
+            system = system,
+            user = user,
+            temperature = temperature,
+            // For raw text we do NOT force JSON mime type
+            responseMimeType = null
         )
 
-        val body = RequestBody.create(mediaType, ObjectMapper().writeValueAsString(payload))
-
-        val request = Request.Builder()
-            .url("http://localhost:11434/api/chat")
-            .post(body)
-            .build()
-
-        client.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                e.printStackTrace()
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                val source = response.body?.source()
-                while (!source!!.exhausted()) {
-                    val line = source.readUtf8Line()
-                    onChunk(line ?: "")
-                }
-                onComplete()
-            }
-        })
-    }
-
-
-    fun completeBlocking(prompt: String): String {
-        val latch = CountDownLatch(1)
-        val out = StringBuilder()
-        sendPromptStreaming(
-            prompt = prompt,
-            onChunk = { chunk -> out.append(chunk) },
-            onComplete = { latch.countDown() }
-        )
-        latch.await()
-        return out.toString().trim()
-    }
-
-
-    fun completeJsonBlocking(system: String, user: String): String {
-        val mediaType = "application/json; charset=utf-8".toMediaType()
-        val payload = mapOf(
-            "model" to "deepseek-coder:6.7b",
-            "messages" to listOf(
-                mapOf("role" to "system", "content" to system),
-                mapOf("role" to "user", "content" to user)
-            ),
-            "stream" to false,
-            "temperature" to 0.0,
-            "format" to "json"
-        )
         val reqJson = mapper.writeValueAsString(payload)
-        println("🟦 [Ollama] REQUEST JSON (${reqJson.length} chars)")
+        println("🟦 [Gemini] REQUEST RAW (${reqJson.length} chars)")
         println(reqJson.take(4000) + if (reqJson.length > 4000) " ...[truncated]" else "")
 
-        val body = reqJson.toRequestBody(mediaType)
         val request = Request.Builder()
-            .url("http://localhost:11434/api/chat")
-            .post(body)
+            .url(url)
+            .post(reqJson.toRequestBody(mediaType))
             .build()
 
         client.newCall(request).execute().use { resp ->
             val raw = resp.body?.string().orEmpty().trim()
-            println("🟩 [Ollama] RAW RESPONSE (${raw.length} chars)")
+            println("🟩 [Gemini] RAW TEXT (${raw.length} chars)")
             println(raw.take(4000) + if (raw.length > 4000) " ...[truncated]" else "")
-            val node = mapper.readTree(raw)
-            val content = node.path("message").path("content").asText("")
-            if (content.isBlank()) {
-                println("🟨 [Ollama] WARNING: 'message.content' empty, returning RAW response")
-                return raw
+
+            return extractTextFromGemini(raw).ifBlank { raw }
+        }
+    }
+
+    fun completeJsonBlocking(system: String, user: String): String {
+        val model = "gemini-1.5-flash"
+        val url = endpoint(model, apiKey)
+        val payload = buildGeminiPayload(
+            system = system,
+            user = user,
+            temperature = 0.0,
+            responseMimeType = "application/json"
+        )
+
+        val reqJson = mapper.writeValueAsString(payload)
+        println("🟦 [Gemini] REQUEST JSON (${reqJson.length} chars)")
+        println(reqJson.take(4000) + if (reqJson.length > 4000) " ...[truncated]" else "")
+
+        val request = Request.Builder()
+            .url(url)
+            .post(reqJson.toRequestBody(mediaType))
+            .build()
+
+        client.newCall(request).execute().use { resp ->
+            val raw = resp.body?.string().orEmpty().trim()
+            println("🟩 [Gemini] RAW RESPONSE (${raw.length} chars)")
+            println(raw.take(4000) + if (raw.length > 4000) " ...[truncated]" else "")
+
+            val text = extractTextFromGemini(raw)
+            if (text.isNotBlank()) return text
+
+            val i = raw.indexOf('{');
+            val j = raw.lastIndexOf('}')
+            return if (i != -1 && j > i) raw.substring(i, j + 1) else raw
+        }
+    }
+
+    // --- Internals ---------------------------------------------------------------------------
+
+    private fun endpoint(model: String, apiKey: String): String =
+        "https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=$apiKey"
+
+    /**
+     * Gemini request schema:
+     * {
+     *   "systemInstruction": {"role":"system","parts":[{"text": "..."}]},
+     *   "contents": [{"role":"user","parts":[{"text":"..."}]}],
+     *   "generationConfig": {"temperature":0.0,"response_mime_type":"application/json"?}
+     * }
+     */
+    private fun buildGeminiPayload(
+        system: String,
+        user: String,
+        temperature: Double,
+        responseMimeType: String?
+    ): Map<String, Any> {
+
+        val generationCfg = mutableMapOf<String, Any>(
+            "temperature" to temperature
+        )
+        if (!responseMimeType.isNullOrBlank()) {
+            generationCfg["response_mime_type"] = responseMimeType
+        }
+
+        val body = mutableMapOf<String, Any>(
+            "contents" to listOf(
+                mapOf(
+                    "role" to "user",
+                    "parts" to listOf(mapOf("text" to user))
+                )
+            ),
+            "generationConfig" to generationCfg
+        )
+
+        if (system.isNotBlank()) {
+            body["systemInstruction"] = mapOf(
+                "role" to "system",
+                "parts" to listOf(mapOf("text" to system))
+            )
+        }
+
+        return body
+    }
+
+
+    private fun extractTextFromGemini(raw: String): String {
+        return try {
+            val root: JsonNode = mapper.readTree(raw)
+            val candidates = root.path("candidates")
+            if (!candidates.isArray || candidates.size() == 0) return ""
+
+            val content = candidates[0].path("content")
+            val parts = content.path("parts")
+            if (!parts.isArray || parts.size() == 0) return ""
+
+            val sb = StringBuilder()
+            for (p in parts) {
+                val t = p.path("text").asText("")
+                if (t.isNotBlank()) sb.append(t)
             }
-            return content
+            sb.toString().trim()
+        } catch (_: Exception) {
+            ""
         }
     }
 }

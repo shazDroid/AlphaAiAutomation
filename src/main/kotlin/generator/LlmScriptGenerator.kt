@@ -1,7 +1,6 @@
 package generator
 
 import agent.ActionPlan
-import agent.Locator
 import agent.Snapshot
 import agent.StepType
 import agent.Strategy
@@ -10,6 +9,7 @@ import ui.OllamaClient
 import java.io.File
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 class LlmScriptGenerator(
     private val ollama: OllamaClient,
@@ -17,10 +17,19 @@ class LlmScriptGenerator(
 ) {
     private val mapper = jacksonObjectMapper()
 
-    fun generate(plan: ActionPlan, timeline: List<Snapshot>) {
+    fun generate(
+        plan: ActionPlan,
+        timeline: List<Snapshot>,
+        onProgress: (Int, Int, String) -> Unit = { _, _, _ -> }
+    ): File {
         outDir.mkdirs()
 
-        // ---- SUMMARY_JSON ----------------------------------------------------------
+        val total = 5
+        var step = 0
+        fun tick(msg: String) { step += 1; onProgress(step, total, msg) }
+
+        // ------ SUMMARY_JSON ------------------------------------------------------
+        tick("Preparing context")
         val summaryJson = mapper.writeValueAsString(
             mapOf(
                 "title" to plan.title,
@@ -35,232 +44,279 @@ class LlmScriptGenerator(
             )
         )
 
-        // ---- LOCATORS_JSON.bestByHint from snapshots ----------------------------------------
-        data class LRec(
-            val step: Int,
-            val hint: String,
-            val strategy: String,
-            val value: String,
-            val wdio: String
-        )
+        // ------ Build action-specific selector maps from successful interactions --
+        data class Rec(val step: Int, val hint: String, val type: StepType, val sel: String)
 
-        val recs: List<LRec> = timeline.mapNotNull { snap ->
-            val loc: Locator = snap.resolvedLocator ?: return@mapNotNull null
+        fun toSelectorString(strategy: Strategy, value: String): String? = when (strategy) {
+            Strategy.XPATH       -> value                      // //...
+            Strategy.ID          -> "id=$value"               // id=com.pkg:id/foo
+            Strategy.DESC        -> "~$value"                 // ~content-desc
+            Strategy.UIAUTOMATOR -> "android=$value"          // android=new UiSelector()...
+            else                 -> null                      // ignore unknowns
+        }
+
+        val recs: List<Rec> = timeline.mapNotNull { snap ->
+            val loc = snap.resolvedLocator ?: return@mapNotNull null
             val hint = (snap.targetHint ?: "").trim()
             if (hint.isEmpty()) return@mapNotNull null
-            LRec(
-                step = snap.stepIndex,
-                hint = hint,
-                strategy = loc.strategy.name,
-                value = loc.value,
-                wdio = toWdioSelector(loc.strategy, loc.value)
-            )
+            val stepType = stepTypeForIndex(plan, snap.stepIndex) ?: return@mapNotNull null
+            val sel = toSelectorString(loc.strategy, loc.value) ?: return@mapNotNull null
+            if (sel.isBlank()) return@mapNotNull null
+            Rec(step = snap.stepIndex, hint = hint, type = stepType, sel = sel)
         }
 
-        fun stratRank(s: String) = when (s) {
-            "ID" -> 4; "DESC" -> 3; "UIAUTOMATOR" -> 2; "XPATH" -> 1; else -> 1
-        }
+        fun lastByType(targetTypes: Set<StepType>): Map<String, String> =
+            recs.filter { it.type in targetTypes }
+                .groupBy { it.hint }
+                .mapValues { (_, g) -> g.maxBy { it.step }.sel }
 
-        val bestFromRecs: Map<String, String> =
-            recs.groupBy { it.hint }
-                .mapValues { (_, group) ->
-                    group.maxWith(compareBy<LRec> { stratRank(it.strategy) }.thenBy { it.step }).wdio
-                }
+        val inputSelectors   = lastByType(setOf(StepType.INPUT_TEXT))
+        val tapSelectors     = lastByType(setOf(StepType.TAP))
+        val assertSelectors  = lastByType(setOf(StepType.WAIT_TEXT, StepType.CHECK, StepType.ASSERT_TEXT))
+        val lockedSelectors  = recs.groupBy { it.hint }.mapValues { (_, g) -> g.maxBy { it.step }.sel }
 
-        // Ensure every referenced hint has a selector
-        val mergedBestByHint = linkedMapOf<String, String>().apply { putAll(bestFromRecs) }
-        val referencedHints = plan.steps
-            .filter { it.type in setOf(StepType.INPUT_TEXT, StepType.TAP, StepType.WAIT_TEXT) }
+        // All hints referenced by steps must have some recorded selector
+        val requiredHints = plan.steps
+            .filter { it.type in setOf(StepType.INPUT_TEXT, StepType.TAP, StepType.WAIT_TEXT, StepType.CHECK, StepType.ASSERT_TEXT) }
             .mapNotNull { it.targetHint?.trim() }
             .filter { it.isNotEmpty() }
-        for (hint in referencedHints) {
-            if (!mergedBestByHint.containsKey(hint)) {
-                mergedBestByHint[hint] = fallbackSelectorFor(hint)
+            .toSet()
+
+        val missing = buildList<String> {
+            for (h in requiredHints) {
+                val hasAny = inputSelectors.containsKey(h) ||
+                        tapSelectors.containsKey(h) ||
+                        assertSelectors.containsKey(h) ||
+                        lockedSelectors.containsKey(h)
+                if (!hasAny) add(h)
             }
         }
+        require(missing.isEmpty()) {
+            "Missing recorded selector for: $missing. Ensure the agent stores the selector actually used for those interactions."
+        }
 
-        val locatorsJson = mapper.writeValueAsString(
+        // Serialize maps for LLM context
+        val inputJson   = mapper.writeValueAsString(mapOf("bestByHint" to inputSelectors))
+        val tapJson     = mapper.writeValueAsString(mapOf("bestByHint" to tapSelectors))
+        val assertJson  = mapper.writeValueAsString(mapOf("bestByHint" to assertSelectors))
+        val lockedJson  = mapper.writeValueAsString(mapOf("bestByHint" to lockedSelectors))
+        val rolesJson   = mapper.writeValueAsString(
             mapOf(
-                "elements" to recs,
-                "bestByHint" to mergedBestByHint
+                "inputHints"  to plan.steps.filter { it.type == StepType.INPUT_TEXT }.mapNotNull { it.targetHint },
+                "tapHints"    to plan.steps.filter { it.type == StepType.TAP }.mapNotNull { it.targetHint },
+                "assertHints" to plan.steps.filter { it.type in setOf(StepType.WAIT_TEXT, StepType.CHECK, StepType.ASSERT_TEXT) }.mapNotNull { it.targetHint }
             )
         )
 
-        val selectorsJson = mapper.writeValueAsString(
-            mapOf("bestByHint" to mergedBestByHint) // ← no giant elements[] list
-        )
+        // ------ System instruction ----------
+        val systemRules = """
+            You are a code generator for a TypeScript + WebdriverIO + Cucumber + Appium (Android) repository.
 
-        // ---- Prompt with strict markers ------------------------------------------------------
+            OUTPUT CONTRACT — print EXACTLY these four sections, nothing else:
+            ### BASE_PAGE_START ... ### BASE_PAGE_END
+            ### ANDROID_PAGE_START ... ### ANDROID_PAGE_END
+            ### STEP_DEFS_START ... ### STEP_DEFS_END
+            ### FEATURE_FILE_START ... ### FEATURE_FILE_END
+
+            SELECTOR SOURCES (authoritative):
+            - INPUT_SELECTORS.bestByHint: exact selector strings used for INPUT_TEXT (typing).
+            - TAP_SELECTORS.bestByHint:   exact selector strings used for taps.
+            - ASSERT_SELECTORS.bestByHint: exact selector strings used for visibility/assert waits.
+            - LOCKED_SELECTORS.bestByHint: last successful selector for any action (fallback only if the role-specific map lacks the hint).
+
+            CRITICAL RULES:
+            - Use the selector string **verbatim**. Do NOT transform or invent.
+            - Page objects must embed selectors directly in WDIO `$()`:
+                * If selector starts with "//"     -> return $('//…')      // XPath
+                * If selector starts with "id="    -> return $('id=…')      // resource-id
+                * If selector starts with "android=" -> return $('android=…') // UiAutomator
+                * If selector starts with "~"      -> return $('~…')        // content-desc
+            - Do NOT use UiSelectorBuilderAndroid or any builder/regex helper.
+            - For each getter:
+                * If its hint is in inputHints, use INPUT_SELECTORS.bestByHint[hint]
+                * If in tapHints, use TAP_SELECTORS.bestByHint[hint]
+                * If in assertHints, use ASSERT_SELECTORS.bestByHint[hint]
+                * Otherwise fallback to LOCKED_SELECTORS.bestByHint[hint]
+
+            FILE STYLE (match existing project):
+            1) pageobjects/base/BaseDashboardPage.ts
+               - TypeScript; export default abstract class BaseDashboardPage
+               - Declare getters/methods actually used by the scenario (txtUsername, txtPassword, btnLogin, tabServices, banner, etc).
+
+            2) pageobjects/android/AndroidDashboardPage.ts
+               - TypeScript; class AndroidDashboardPage extends BaseDashboardPage
+               - Each getter returns $('<selector>') with the exact selector from the correct map (see above).
+
+            3) step-definitions/dashboard/dashboard.steps.ts
+               - WDIO Cucumber with async/await; use only page-object getters/methods.
+
+            4) features/services/<slug>.feature
+               - Gherkin; Scenario Outline & Examples.
+               e.g Feature: Action Plan
+
+                    Scenario: Action Plan
+                    Given I login with <"username"> and <"password">
+                    | username | password | 
+                    | kycuser2 | Test@112 |
+
+            Begin your reply with: ### BASE_PAGE_START
+            No prose/explanations outside the four sections.
+        """.trimIndent()
+
+        // ------ Compose LLM user prompt with context ------------------------------
+        tick("Calling LLM")
         val userPrompt = buildString {
-            appendLine("You are a senior test automation generator for WebdriverIO + Cucumber + Appium (Android).")
-            appendLine("Do NOT output JSON. Do NOT echo the context. Output ONLY the four sections,")
-            appendLine("each wrapped by its exact start/end markers. Begin your reply with the line:")
-            appendLine("### BASE_CLASS_START")
-            appendLine()
             appendLine("CONTEXT_JSON_START")
             appendLine("SUMMARY_JSON:"); appendLine(summaryJson)
             appendLine()
-            appendLine("SELECTORS:"); appendLine(selectorsJson)
+            appendLine("INPUT_SELECTORS:"); appendLine(inputJson)
+            appendLine("TAP_SELECTORS:"); appendLine(tapJson)
+            appendLine("ASSERT_SELECTORS:"); appendLine(assertJson)
+            appendLine("LOCKED_SELECTORS:"); appendLine(lockedJson)
+            appendLine("HINT_ROLES:"); appendLine(rolesJson)
             appendLine("CONTEXT_JSON_END")
             appendLine()
-            appendLine("RULES:")
-            appendLine("- Never output an ActionPlan or any object with keys like \"title\" or \"steps\".")
-            appendLine("- Use SELECTORS.bestByHint EXACTLY for PlatformPage getters. No invented selectors.")
-            appendLine("- Use TypeScript code fences inside each section. Nothing outside markers.")
+            appendLine("Now output the four sections exactly as specified above.")
             appendLine()
-            appendLine("### BASE_CLASS_START")
-            appendLine("TypeScript: abstract class `BasePage` with ONLY abstract getters for ALL hints present in SELECTORS.bestByHint.")
-            appendLine("Each getter signature:  public abstract get <camelName>(): ChainablePromiseElement<WebdriverIO.Element>;")
+            appendLine("### BASE_PAGE_START")
             appendLine("```ts")
-            appendLine("export default abstract class BasePage {")
-            appendLine("  // example shape (real list must cover ALL hints)")
-            appendLine("  public abstract get login(): ChainablePromiseElement<WebdriverIO.Element>;")
-            appendLine("}")
+            appendLine("// pageobjects/base/BaseDashboardPage.ts")
+            appendLine("// Abstract class with getters/methods used by the steps")
             appendLine("```")
-            appendLine("### BASE_CLASS_END")
+            appendLine("### BASE_PAGE_END")
             appendLine()
-            appendLine("### PLATFORM_CLASS_START")
-            appendLine("TypeScript: class `PlatformPage` extends `BasePage`. Override EVERY getter using EXACT strings from SELECTORS.bestByHint.")
-            appendLine("Example form:  return $('id=com.example:id/loginBtn')  OR  return $('android=new UiSelector().text(\"Login\")');")
+            appendLine("### ANDROID_PAGE_START")
             appendLine("```ts")
-            appendLine("import BasePage from './BasePage';")
-            appendLine("class PlatformPage extends BasePage { /* getters filled with SELECTORS.bestByHint */ }")
-            appendLine("export default new PlatformPage();")
+            appendLine("// pageobjects/android/AndroidDashboardPage.ts")
+            appendLine("// Use INPUT_SELECTORS for INPUT_TEXT; TAP_SELECTORS for taps; ASSERT_SELECTORS for waits; else LOCKED_SELECTORS.")
+            appendLine("// Embed selector strings verbatim via $('id=...') | $('//...') | $('android=...') | $('~...'). No builders.")
             appendLine("```")
-            appendLine("### PLATFORM_CLASS_END")
+            appendLine("### ANDROID_PAGE_END")
             appendLine()
             appendLine("### STEP_DEFS_START")
-            appendLine("TypeScript step defs using ONLY PlatformPage getters (no raw selectors):")
-            appendLine("- Given the app is launched")
-            appendLine("- When I type \"{value}\" into \"{hint}\"")
-            appendLine("- When I tap \"{hint}\"")
-            appendLine("- Then I should see \"{hint}\" (skip if empty)")
-            appendLine("Include a tiny helper that maps hints to the camelCase getter key.")
             appendLine("```ts")
-            appendLine("// step defs here")
+            appendLine("// step-definitions/dashboard/dashboard.steps.ts")
+            appendLine("// Use ONLY page object getters/methods")
             appendLine("```")
             appendLine("### STEP_DEFS_END")
             appendLine()
             appendLine("### FEATURE_FILE_START")
-            appendLine("One concise .feature with Feature/Scenario following SUMMARY_JSON order.")
             appendLine("```gherkin")
-            appendLine("// gherkin here")
+            appendLine("// features/services/<slug>.feature (slug from the title)")
             appendLine("```")
             appendLine("### FEATURE_FILE_END")
         }
 
-
-        // ---- Debug folder --------------------------------------------------------------------
+        // ------  Debug -------------------------------------------------------------
         val stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))
         val debugDir = outDir.resolve("_debug_$stamp").apply { mkdirs() }
         debugWrite(debugDir, "summary.json", summaryJson)
-        debugWrite(debugDir, "locators.json", locatorsJson)
+        debugWrite(debugDir, "input_selectors.json", inputJson)
+        debugWrite(debugDir, "tap_selectors.json", tapJson)
+        debugWrite(debugDir, "assert_selectors.json", assertJson)
+        debugWrite(debugDir, "locked_selectors.json", lockedJson)
+        debugWrite(debugDir, "roles.json", rolesJson)
         debugWrite(debugDir, "prompt_markers.txt", userPrompt)
 
-        // ---- LLM call (strict markers) -------------------------------------------------------
-        var raw = ollama.completeJsonBlocking(system = "", user = userPrompt)
+        // ------  LLM call ----------------------------------------------------------
+        var raw = OllamaClient.completeRawBlocking(system = systemRules, user = userPrompt, temperature = 0.0)
+        raw = normalizeMarkers(raw)
         debugWrite(debugDir, "raw_response_1.txt", raw)
 
-        var baseBlock = extractMarked(raw, "BASE_CLASS_START", "BASE_CLASS_END")
-        var platformBlock = extractMarked(raw, "PLATFORM_CLASS_START", "PLATFORM_CLASS_END")
-        var stepsBlock = extractMarked(raw, "STEP_DEFS_START", "STEP_DEFS_END")
-        var featureBlock = extractMarked(raw, "FEATURE_FILE_START", "FEATURE_FILE_END")
+        // One repair attempt if any section missing
+        fun extract(name: String, end: String) = extractMarked(raw, name, end)
+        var baseBlock    = extract("BASE_PAGE_START", "BASE_PAGE_END")
+        var androidBlock = extract("ANDROID_PAGE_START", "ANDROID_PAGE_END")
+        var stepsBlock   = extract("STEP_DEFS_START", "STEP_DEFS_END")
+        var featureBlock = extract("FEATURE_FILE_START", "FEATURE_FILE_END")
 
-        // One repair attempt (LLM only) if any section missing
-        if (listOf(baseBlock, platformBlock, stepsBlock, featureBlock).any { it.isNullOrBlank() }) {
-            val repairPrompt = buildString {
-                appendLine("Your previous reply violated the format. Do NOT output JSON.")
-                appendLine("Start NOW with the line: ### BASE_CLASS_START")
-                appendLine("Then emit the four sections exactly as instructed. Nothing else.")
-                appendLine()
-                appendLine("CONTEXT_JSON_START")
-                appendLine("SUMMARY_JSON:"); appendLine(summaryJson)
-                appendLine()
-                appendLine("SELECTORS:"); appendLine(selectorsJson)
-                appendLine("CONTEXT_JSON_END")
-                appendLine()
-                appendLine("Sections to output verbatim in this order (each with fenced code inside):")
-                appendLine("### BASE_CLASS_START ... ### BASE_CLASS_END")
-                appendLine("### PLATFORM_CLASS_START ... ### PLATFORM_CLASS_END")
-                appendLine("### STEP_DEFS_START ... ### STEP_DEFS_END")
-                appendLine("### FEATURE_FILE_START ... ### FEATURE_FILE_END")
-            }
-
-            raw = ollama.completeJsonBlocking(system = "", user = repairPrompt)
+        if (listOf(baseBlock, androidBlock, stepsBlock, featureBlock).any { it.isNullOrBlank() }) {
+            val repair = """
+                Your previous reply missed required sections.
+                Reprint all four sections exactly, starting with: ### BASE_PAGE_START
+            """.trimIndent()
+            raw = OllamaClient.completeRawBlocking(system = systemRules, user = repair + "\n\n" + userPrompt, temperature = 0.0)
+            raw = normalizeMarkers(raw)
             debugWrite(debugDir, "raw_response_2_repair.txt", raw)
-
-            baseBlock = extractMarked(raw, "BASE_CLASS_START", "BASE_CLASS_END")
-            platformBlock = extractMarked(raw, "PLATFORM_CLASS_START", "PLATFORM_CLASS_END")
-            stepsBlock = extractMarked(raw, "STEP_DEFS_START", "STEP_DEFS_END")
-            featureBlock = extractMarked(raw, "FEATURE_FILE_START", "FEATURE_FILE_END")
+            baseBlock    = extract("BASE_PAGE_START", "BASE_PAGE_END")
+            androidBlock = extract("ANDROID_PAGE_START", "ANDROID_PAGE_END")
+            stepsBlock   = extract("STEP_DEFS_START", "STEP_DEFS_END")
+            featureBlock = extract("FEATURE_FILE_START", "FEATURE_FILE_END")
         }
 
-        require(!baseBlock.isNullOrBlank())     { "LLM failed to produce BASE_CLASS section" }
-        require(!platformBlock.isNullOrBlank()) { "LLM failed to produce PLATFORM_CLASS section" }
-        require(!stepsBlock.isNullOrBlank())    { "LLM failed to produce STEP_DEFS section" }
-        require(!featureBlock.isNullOrBlank())  { "LLM failed to produce FEATURE_FILE section" }
+        require(!baseBlock.isNullOrBlank())    { "LLM failed to produce BaseDashboardPage" }
+        require(!androidBlock.isNullOrBlank()) { "LLM failed to produce AndroidDashboardPage" }
+        require(!stepsBlock.isNullOrBlank())   { "LLM failed to produce step definitions" }
+        require(!featureBlock.isNullOrBlank()) { "LLM failed to produce feature file" }
 
-        val files = mapOf(
-            "BasePage.ts" to stripFences(baseBlock!!),
-            "PlatformPage.ts" to stripFences(platformBlock!!),
-            "StepDefinitions.ts" to stripFences(stepsBlock!!),
-            "feature.feature" to stripFences(featureBlock!!)
-        )
-        debugWrite(debugDir, "parsed_from_markers.json", mapper.writeValueAsString(files))
+        // ------ Validate: no builder, no prose, selectors embedded via $() --------
+        val androidCode = stripFences(androidBlock!!)
+        require(!Regex("""UiSelectorBuilderAndroid""").containsMatchIn(androidCode)) {
+            "Generated page must not use UiSelectorBuilderAndroid."
+        }
 
-        write(outDir.resolve("pages"), "BasePage.ts", files["BasePage.ts"])
-        write(outDir.resolve("pages"), "PlatformPage.ts", files["PlatformPage.ts"])
-        write(outDir.resolve("steps"), "StepDefinitions.ts", files["StepDefinitions.ts"])
-        write(outDir.resolve("features"), "feature.feature", files["feature.feature"])
+        require(Regex("""\$\(['"]""").containsMatchIn(androidCode)) {
+            "Generated page did not embed any WDIO $('…') selectors."
+        }
 
+        // ------ Write files -------------------------------------------------------
+        tick("Writing files")
+
+        val baseCode    = stripFences(baseBlock!!)
+        val stepsCode   = stripFences(stepsBlock!!)
+        val featureCode = stripFences(featureBlock!!)
+
+        write(outDir.resolve("pageobjects/base"), "BaseDashboardPage.ts", baseCode)
+        write(outDir.resolve("pageobjects/android"), "AndroidDashboardPage.ts", androidCode)
+        write(outDir.resolve("step-definitions/dashboard"), "dashboard.steps.ts", stepsCode)
+
+        val slug = slugify(plan.title.ifBlank { "generated-scenario" })
+        write(outDir.resolve("features/services"), "$slug.feature", featureCode)
+
+        tick("Done")
         println("✅ [Gen] Scripts written to ${outDir.absolutePath}")
         debugWrite(debugDir, "done.txt", "OK")
+        return outDir
     }
 
-    // --------------------------- Helpers ------------------------------------
+    // ------------------------------- Helpers ---------------------------------------
 
-    private fun toWdioSelector(strategy: Strategy, value: String): String = when (strategy) {
-        Strategy.ID          -> "id=$value"
-        Strategy.DESC        -> "~$value"
-        Strategy.UIAUTOMATOR -> "android=$value"
-        Strategy.XPATH       -> value
-        else                 -> value
-    }
+    private fun slugify(s: String): String =
+        s.lowercase(Locale.ENGLISH).replace(Regex("[^a-z0-9]+"), "-").trim('-')
 
-    private fun fallbackSelectorFor(hint: String): String {
-        val clean = normalizeLabel(hint)
-        return """android=new UiSelector().textContains("$clean")"""
-    }
-
-    private fun normalizeLabel(raw: String): String {
-        var s = raw
-            .replace(Regex("(?i)\\b(click|tap|press|open|go to|select|choose|wait|assert)\\b"), "")
-            .replace(Regex("(?i)\\b(button|tab|icon|item|menu|link|option|text|field|input)\\b"), "")
-            .replace(Regex("[\\p{Punct}]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        if (s.isBlank()) s = raw.trim()
-        return if (s == s.uppercase()) s else s.replaceFirstChar { it.uppercase() }
-    }
-
-    private fun write(dir: File, name: String, content: String?) {
-        require(!content.isNullOrBlank()) { "Missing content for $name" }
+    private fun write(dir: File, name: String, content: String) {
         dir.mkdirs()
-        File(dir, name).writeText(content!!)
+        File(dir, name).writeText(content)
     }
 
     private fun debugWrite(folder: File, name: String, data: String) {
         try { File(folder, name).writeText(data) } catch (_: Throwable) {}
     }
 
+    private fun normalizeMarkers(src: String): String {
+        var s = src.replace("\r\n", "\n")
+        s = s.replace(Regex("""\n##\s+BASE_PAGE_START""", RegexOption.IGNORE_CASE), "\n### BASE_PAGE_START")
+            .replace(Regex("""\n##\s+BASE_PAGE_END""", RegexOption.IGNORE_CASE), "\n### BASE_PAGE_END")
+            .replace(Regex("""\n##\s+ANDROID_PAGE_START""", RegexOption.IGNORE_CASE), "\n### ANDROID_PAGE_START")
+            .replace(Regex("""\n##\s+ANDROID_PAGE_END""", RegexOption.IGNORE_CASE), "\n### ANDROID_PAGE_END")
+            .replace(Regex("""\n##\s+STEP_DEFS_START""", RegexOption.IGNORE_CASE), "\n### STEP_DEFS_START")
+            .replace(Regex("""\n##\s+STEP_DEFS_END""", RegexOption.IGNORE_CASE), "\n### STEP_DEFS_END")
+            .replace(Regex("""\n##\s+FEATURE_FILE_START""", RegexOption.IGNORE_CASE), "\n### FEATURE_FILE_START")
+            .replace(Regex("""\n##\s+FEATURE_FILE_END""", RegexOption.IGNORE_CASE), "\n### FEATURE_FILE_END")
+        return s
+    }
+
     private fun extractMarked(src: String, start: String, end: String): String? {
-        val re = Regex("###\\s+$start\\s*\\n(.*?)\\n###\\s+$end", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))
+        val re = Regex("""(?is)###\s+$start\b.*?\R+([\s\S]*?)\R*###\s+$end\b""")
         return re.find(src)?.groupValues?.get(1)?.trim()
     }
 
     private fun stripFences(code: String): String {
-        val m = Regex("^```[a-zA-Z]*\\s*\\n([\\s\\S]*?)\\n```\\s*$", RegexOption.MULTILINE)
-        val mm = m.find(code)
-        return (mm?.groupValues?.get(1) ?: code).trim()
+        val fence = Regex("""^\s*```[\w-]*\s*\n([\s\S]*?)\n?```\s*$""", RegexOption.DOT_MATCHES_ALL)
+        val m = fence.find(code)
+        return (m?.groupValues?.get(1) ?: code).trim()
     }
+
+    private fun stepTypeForIndex(plan: ActionPlan, idx: Int): StepType? =
+        plan.steps.firstOrNull { it.index == idx }?.type
 }

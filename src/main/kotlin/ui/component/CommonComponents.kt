@@ -4,13 +4,17 @@ import agent.Snapshot
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.LinearProgressIndicator
 import androidx.compose.material.MaterialTheme
 import androidx.compose.material.Text
 import androidx.compose.runtime.Composable
@@ -78,3 +82,71 @@ fun RightCard(
             .padding(pad)
     ) { content() }
 }
+
+@Composable
+fun GenerationStatusCard(
+    isGenerating: Boolean,
+    step: Int,
+    total: Int,
+    message: String,
+    error: String?,
+    outDir: java.io.File?
+) {
+    val pct = (step.toFloat().coerceAtLeast(0f) / total.coerceAtLeast(1)).coerceIn(0f, 1f)
+    val bg = when {
+        error != null -> Color(0xFFFFF2F2)
+        !isGenerating && outDir != null -> Color(0xFFE9FFF1)
+        else -> Color(0xffffffff)
+    }
+    val border = when {
+        error != null -> Color(0xFFFFC7C7)
+        !isGenerating && outDir != null -> Color(0xFFBFEBD0)
+        else -> Color(0xFFDDE6FF)
+    }
+
+    Box(
+        Modifier.fillMaxWidth()
+            .background(bg, RoundedCornerShape(10.dp))
+            .border(1.dp, border, RoundedCornerShape(10.dp))
+            .padding(12.dp)
+    ) {
+        Column {
+            if (isGenerating) {
+                Text("Generating scripts…", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(progress = pct, modifier = Modifier.fillMaxWidth())
+                Spacer(Modifier.height(6.dp))
+                Text(message, color = Color(0xFF5A6BFF))
+                Text(
+                    "${(pct * 100).toInt()}% · step $step of $total",
+                    color = Color.Gray,
+                    fontSize = TextUnit(12f, TextUnitType.Sp)
+                )
+            } else if (error != null) {
+                Text(
+                    "Generation failed",
+                    color = Color(0xFFB00020),
+                    fontWeight = MaterialTheme.typography.h6.fontWeight
+                )
+                Spacer(Modifier.height(6.dp))
+                SelectionContainer { Text(error, color = Color(0xFF7A0000)) }
+            } else if (outDir != null) {
+                Text(
+                    "Scripts generated",
+                    color = Color(0xFF137333),
+                    fontWeight = MaterialTheme.typography.h6.fontWeight
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(outDir.absolutePath, color = Color(0xFF1F5F3E))
+                Spacer(Modifier.height(8.dp))
+                AlphaButton(text = "Open folder") {
+                    try {
+                        java.awt.Desktop.getDesktop().open(outDir)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+    }
+}
+
