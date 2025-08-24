@@ -30,7 +30,7 @@ dependencies {
     implementation("io.github.ismai117:kottie:1.9.6")
 
     // Appium
-    implementation("io.appium:java-client:9.2.3")
+    implementation("io.appium:java-client:10.0.0")
     implementation("org.seleniumhq.selenium:selenium-java:4.23.0")
 
 

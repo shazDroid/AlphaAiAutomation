@@ -1,6 +1,7 @@
 // agent/InputEngine.kt
 package agent
 
+import io.appium.java_client.AppiumBy
 import io.appium.java_client.android.AndroidDriver
 import io.appium.java_client.android.nativekey.AndroidKey
 import io.appium.java_client.android.nativekey.KeyEvent
@@ -44,7 +45,7 @@ object InputEngine {
         else {
             val desc = runCatching {
                 el.findElement(
-                    io.appium.java_client.AppiumBy.xpath(
+                    AppiumBy.xpath(
                         ".//*[contains(@class,'EditText') or contains(@class,'TextInputEditText') or contains(@class,'AutoCompleteTextView')]"
                     )
                 )
@@ -64,7 +65,6 @@ object InputEngine {
             return loc
         }.onFailure { log("  sendKeys failed: ${it.message}") }
 
-        // Fallback: clipboard + AndroidKey.PASTE
         runCatching {
             log("  try clipboard + AndroidKey.PASTE")
             driver.setClipboardText(value)
@@ -109,7 +109,6 @@ object InputEngine {
     ) {
         log("SLIDE → \"$targetHint\" (left → right)")
 
-        // Find the slider element
         val loc = resolver.resolve(targetHint, log)
         val el = driver.findElement(loc.toBy())
         val r = el.rect
