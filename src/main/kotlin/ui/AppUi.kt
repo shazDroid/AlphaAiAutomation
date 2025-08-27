@@ -9,6 +9,7 @@ import agent.IntentParser
 import agent.LocatorResolver
 import agent.Snapshot
 import agent.SnapshotStore
+import agent.llm.LlmDisambiguator
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.desktop.ui.tooling.preview.Preview
 import androidx.compose.foundation.*
@@ -126,7 +127,7 @@ fun AppUI() {
             AdbExecutor.screencapPng(selectedDevice)?.let { bytes ->
                 agentImage = org.jetbrains.skia.Image.makeFromEncoded(bytes).asImageBitmap()
             }
-            delay(700)
+            delay(100)
         }
     }
 
@@ -166,6 +167,18 @@ fun AppUI() {
         scope.launch(Dispatchers.IO) {
             delay(2800L); playing = false
         }
+    }
+
+    val disambiguator = remember {
+        // Your implementation of LlmDisambiguator (e.g., Gemini-backed)
+        // Example: agent.llm.GeminiDisambiguator(ui.OllamaClient)
+        null as LlmDisambiguator? // keep null if you don't have one yet
+    }
+
+    val reranker = remember {
+        // Your implementation of SemanticReranker, or keep null to disable
+        // Example: agent.semantic.SemanticReranker(agent.semantic.GeminiEmbedder(OllamaClient.apiKey))
+        null as agent.semantic.SemanticReranker?
     }
 
     /* ===================== LAYOUT ===================== */
@@ -306,7 +319,9 @@ fun AppUI() {
                     },
                     onGenError = { msg ->
                         genState = genState.copy(visible = true, isGenerating = false, error = msg, message = "Failed")
-                    }
+                    },
+                    llmDisambiguator = disambiguator,
+                    semanticReranker = reranker
                 )
 
                 Spacer(Modifier.height(16.dp))
@@ -435,7 +450,7 @@ fun AppUI() {
 
                         // --- Device preview (bigger) ---
                         RightCard(
-                            modifier = Modifier.weight(0.60f).height(540.dp),
+                            modifier = Modifier.weight(0.52f).height(680.dp),
                             pad = 8.dp
                         ) {
                             if (agentImage != null) {
@@ -867,6 +882,8 @@ fun AgentComponent(
     onGenProgress: (step: Int, total: Int, msg: String) -> Unit,
     onGenDone: (outDir: File) -> Unit,
     onGenError: (msg: String) -> Unit,
+    llmDisambiguator: LlmDisambiguator? = null,
+    semanticReranker: agent.semantic.SemanticReranker? = null
 ) {
     val scope = rememberCoroutineScope()
     var nlTask by remember { mutableStateOf("") }
@@ -877,6 +894,19 @@ fun AgentComponent(
     var isParsing by remember { mutableStateOf(false) }
     var isGenerating by remember { mutableStateOf(false) }
     val intentParser = remember { IntentParser() }
+
+    // Run/stop plumbing
+    var isRunActive by remember { mutableStateOf(false) }
+    var stopRequested by remember { mutableStateOf(false) }
+    var agentJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var driverRef by remember { mutableStateOf<io.appium.java_client.android.AndroidDriver?>(null) }
+    var lastPlanSteps by remember { mutableStateOf(0) }
+
+    val semanticReranker = remember {
+        agent.semantic.SemanticReranker(
+            agent.semantic.GeminiEmbedder(ui.OllamaClient.apiKey)
+        )
+    }
 
     CardBox {
         Column {
@@ -901,14 +931,18 @@ fun AgentComponent(
             )
 
             Spacer(Modifier.height(12.dp))
+
             Row {
                 AlphaButton(text = "Parse Task", isLoading = isParsing) {
                     if (nlTask.isBlank()) {
-                        isParsingTask.invoke(false)
-                        onStatus("Please enter a task."); return@AlphaButton
+                        isParsingTask(false)
+                        onStatus("Please enter a task.")
+                        return@AlphaButton
                     }
-                    isParsingTask.invoke(true)
-                    onShowAgentView(); isParsing = true; onStatus("Parsing task…")
+                    isParsingTask(true)
+                    onShowAgentView()
+                    isParsing = true
+                    onStatus("Parsing task…")
                     scope.launch(Dispatchers.IO) {
                         try {
                             val p = intentParser.parse(nlTask, packageName)
@@ -916,9 +950,10 @@ fun AgentComponent(
                             plan = fixed
                             onStatus("Parsed ${fixed.steps.size} steps.")
                             onLog("Parsed plan: ${fixed.steps.joinToString { "${it.index}:${it.type}" }}")
-                            isParsingTask.invoke(false)
+                            isParsingTask(false)
                         } catch (e: Exception) {
-                            onStatus("Parse error: ${e.message}"); onLog("Parse error: $e")
+                            onStatus("Parse error: ${e.message}")
+                            onLog("Parse error: $e")
                         } finally {
                             isParsing = false
                         }
@@ -927,29 +962,47 @@ fun AgentComponent(
             }
 
             Spacer(Modifier.height(8.dp))
+
             Row {
+                // RUN
                 AlphaButton(text = "Run agent") {
+                    if (isRunActive) {
+                        onStatus("Run already in progress…"); return@AlphaButton
+                    }
                     if (selectedDevice.isBlank()) { onStatus("Select a device first."); onLog("Preflight: no device"); return@AlphaButton }
                     if (!util.AppiumHealth.isReachable()) { onStatus("❌ Appium not reachable at 127.0.0.1:4723"); onLog("Preflight: appium down"); return@AlphaButton }
                     if (!adb.AdbExecutor.isPackageInstalled(selectedDevice, packageName)) { onStatus("❌ Package $packageName not installed"); onLog("Preflight: package missing"); return@AlphaButton }
 
-                    onShowAgentView()
                     val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
+
+                    stopRequested = false
+                    isRunActive = true
+                    lastPlanSteps = p.steps.size
+                    onShowAgentView()
                     onRunState(true, p.steps.size)
                     onStatus("Starting driver/session…")
-                    timeline = emptyList(); onTimelineUpdate(timeline)
+                    timeline = emptyList()
+                    onTimelineUpdate(timeline)
 
-                    scope.launch(Dispatchers.IO) {
+                    agentJob = scope.launch(Dispatchers.IO) {
                         try {
                             val driver = appium.DriverFactory.startAndroid(
                                 udid = selectedDevice,
                                 appPackage = packageName,
                                 appActivity = appActivity
                             )
+                            driverRef = driver
+
                             val resolver = LocatorResolver(driver, onLog)
                             val store = SnapshotStore(driver, File("runs/${System.currentTimeMillis()}"))
 
-                            val result = AgentRunner(driver, resolver, store).run(
+                            val result = AgentRunner(
+                                driver = driver,
+                                resolver = resolver,
+                                store = store,
+                                llmDisambiguator = llmDisambiguator,
+                                semanticReranker
+                            ).run(
                                 plan = p,
                                 onStep = { snap ->
                                     timeline = timeline + snap
@@ -959,29 +1012,47 @@ fun AgentComponent(
                                     onLog("  png: ${snap.screenshotPath}")
                                 },
                                 onLog = onLog,
-                                onStatus = onStatus
+                                onStatus = onStatus,
+                                stopSignal = { stopRequested }
                             )
                             onStatus("Done: ${result.count { it.success }}/${result.size} steps OK")
-                            driver.quit()
                         } catch (e: Exception) {
-                            onStatus("❌ Agent error: ${e.message}"); onLog("Agent error: $e")
+                            if (stopRequested) {
+                                onStatus("⏹️ Stopped by user")
+                                onLog("⏹️ Stopped by user")
+                            } else {
+                                onStatus("❌ Agent error: ${e.message}")
+                                onLog("Agent error: $e")
+                            }
                         } finally {
-                            onRunState(false, p.steps.size)
+                            runCatching { driverRef?.quit() }
+                            driverRef = null
+                            onRunState(false, lastPlanSteps)
+                            isRunActive = false
+                            stopRequested = false
+                            agentJob = null
                         }
                     }
                 }
 
                 Spacer(Modifier.width(8.dp))
+
+                // Generate with AI
                 AlphaButton(text = "Generate with AI") {
+                    if (isRunActive) {
+                        onStatus("Please stop the run first."); return@AlphaButton
+                    }
                     val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
                     if (timeline.isEmpty()) { onStatus("Run the agent first."); return@AlphaButton }
-                    onShowAgentView(); onStatus("Generating scripts with AI…")
+                    onShowAgentView()
+                    onStatus("Generating scripts with AI…")
                     scope.launch(Dispatchers.IO) {
                         try {
                             LlmScriptGenerator(OllamaClient, File(outputDir)).generate(p, timeline)
                             onStatus("Scripts written to $outputDir")
                         } catch (e: Exception) {
-                            onStatus("Generation error: ${e.message}"); onLog("Generation error: $e")
+                            onStatus("Generation error: ${e.message}")
+                            onLog("Generation error: $e")
                         }
                     }
                 }
@@ -989,8 +1060,30 @@ fun AgentComponent(
 
             Spacer(Modifier.height(8.dp))
 
+            // STOP — always visible so it's never "missing"
+            AnimatedVisibility(isRunActive) {
+                AlphaButton(text = "Stop") {
+                    if (!isRunActive) {
+                        onStatus("Nothing to stop.")
+                        return@AlphaButton
+                    }
+                    onStatus("Stopping…")
+                    stopRequested = true
+                    runCatching { driverRef?.quit() }
+                    driverRef = null
+                    agentJob?.cancel()
+                    isRunActive = false
+                    onRunState(false, lastPlanSteps)
+                }
+            }
+
+            Spacer(Modifier.height(8.dp))
+
             Row {
-                AlphaButton(text = "Generate scripts", isLoading = isGenerating, onClick = {
+                AlphaButton(text = "Generate scripts", isLoading = isGenerating) {
+                    if (isRunActive) {
+                        onStatus("Please stop the run first."); return@AlphaButton
+                    }
                     val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
                     if (timeline.isEmpty()) {
                         onStatus("Run the agent first."); return@AlphaButton
@@ -1018,7 +1111,7 @@ fun AgentComponent(
                             isGenerating = false
                         }
                     }
-                })
+                }
             }
 
             Spacer(Modifier.height(8.dp))
@@ -1031,3 +1124,6 @@ fun AgentComponent(
         }
     }
 }
+
+
+

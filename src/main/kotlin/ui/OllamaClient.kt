@@ -30,7 +30,7 @@ object OllamaClient {
     fun completeRawBlocking(
         system: String,
         user: String,
-        model: String = "gemini-2.0-flash",
+        model: String = "gemini-2.5-flash-lite",
         temperature: Double = 0.0
     ): String {
         val url = endpoint(model, apiKey)
@@ -61,7 +61,7 @@ object OllamaClient {
     }
 
     fun completeJsonBlocking(system: String, user: String): String {
-        val model = "gemini-1.5-flash"
+        val model = "gemini-2.5-flash-lite"
         val url = endpoint(model, apiKey)
         val payload = buildGeminiPayload(
             system = system,
