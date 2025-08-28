@@ -16,8 +16,6 @@ import org.openqa.selenium.JavascriptExecutor
 import org.openqa.selenium.OutputType
 import org.openqa.selenium.WebElement
 import org.openqa.selenium.remote.RemoteWebElement
-import kotlin.math.max
-import kotlin.math.min
 
 class AgentRunner(
     private val driver: AndroidDriver,
@@ -32,6 +30,12 @@ class AgentRunner(
     private val DEFAULT_TAP_TIMEOUT_MS = 20_000L
     private val DIALOG_POLL_MS = 140L
     private val DIALOG_WINDOW_AFTER_STEP_MS = 2400L
+
+    // vision cache for identical screenshot bytes
+    private var lastVisionHash: Int = 0
+    private var lastVision: VisionResult? = null
+    private var lastVisionTs: Long = 0L
+
 
     fun run(
         plan: ActionPlan,
@@ -50,7 +54,7 @@ class AgentRunner(
 
         val out = mutableListOf<Snapshot>()
         onLog("Plan started: \"${plan.title}\" (${plan.steps.size} steps)")
-        onLog(if (deki == null) "yolo:disabled" else "yolo:enabled")
+        onLog(if (deki == null) "vision:disabled" else "vision:enabled")
         var pc = 0
         val steps = plan.steps
 
@@ -104,6 +108,7 @@ class AgentRunner(
                         val th = step.targetHint ?: error("Missing target for INPUT_TEXT")
                         val value = step.value ?: error("Missing value for INPUT_TEXT")
                         onStatus("Typing into \"$th\"")
+
                         chosen = withRetry(attempts = 3, delayMs = 650,
                             onError = { n, e -> onLog("  retry($n) INPUT_TEXT: ${e.message}") }) {
                             ensureNotStopped()
@@ -128,48 +133,52 @@ class AgentRunner(
                         onStatus("Tapping \"$th\"")
                         ensureNotStopped()
 
+                        // 1) Vision-first try: find ANY clickable near the detected label text (not just toggles)
                         val handledByVision: Boolean = run {
-                            val vres = analyzeWithYolo("tap.pre", onLog) ?: return@run false
-                            onLog("yolo:tap.pre section=${preferredSection ?: "-"}")
-                            val vr =
-                                ScreenVision.findToggleForLabel(driver, vres, th, preferredSection) ?: return@run false
+                            val vres = analyzeWithVision("tap.pre", onLog) ?: return@run false
+                            onLog("vision:tap.pre section=${preferredSection ?: "-"}")
+                            logVisionSummary(vres, "tap.pre", onLog)
+
+                            val vr = findClickableForLabelViaVision(vres, th, preferredSection, onLog)
+                                ?: return@run false
+
                             val before = safePageSourceHash()
                             runCatching { vr.second.click() }
                             chosen = vr.first
-                            val dialogHandled = runCatching {
-                                handleDialogWithPolling(
-                                    step.index,
-                                    onLog,
-                                    onStatus,
-                                    1600L
-                                )
-                            }.getOrDefault(false)
+
+                            val dialogHandled =
+                                runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }
+                                    .getOrDefault(false)
                             val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
                             if (uiChanged) {
-                                onLog("vision:xpath=${vr.first.value}")
+                                onLog("vision:tap.success xpath=${vr.first.value}")
                                 val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
                                 out += snap
                                 onStep(snap)
                                 pc += 1
                                 true
-                            } else {
-                                false
-                            }
+                            } else false
                         }
                         if (handledByVision) continue
 
-                        val toggleHit = tryToggleByLabel(th, preferredSection, desiredToggle, onLog)
-                        if (toggleHit.first) {
-                            chosen = toggleHit.second
-                            onLog("✓ toggled")
-                            handleDialogWithPolling(step.index, onLog, onStatus, 1400L)
-                            val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                            out += snap
-                            onStep(snap)
-                            pc += 1
-                            continue
+
+                        // 2) Only try toggle path if the user hinted ON/OFF
+                        if (desiredToggle != null) {
+                            val toggleHit = tryToggleByLabel(th, preferredSection, desiredToggle, onLog)
+                            if (toggleHit.first) {
+                                chosen = toggleHit.second
+                                onLog("✓ toggled")
+                                handleDialogWithPolling(step.index, onLog, onStatus, 1400L)
+                                val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                out += snap
+                                onStep(snap)
+                                pc += 1
+                                continue
+                            }
                         }
 
+
+                        // 3) Normal candidate search + LLM/semantic rerank (vision-aware scoping)
                         val deadline = System.currentTimeMillis() + timeout
                         var changed = false
                         var tappedLocator: Locator? = null
@@ -186,11 +195,19 @@ class AgentRunner(
                             }
                             if (all0.isEmpty()) { Thread.sleep(300); continue }
 
-                            val vres = analyzeWithYolo("tap.loop", onLog)
-                            val all = if (preferredSection != null && vres != null)
-                                ScreenVision.restrictCandidatesToSection(driver, all0, vres, preferredSection)
-                            else
+                            val vres = analyzeWithVision("tap.loop", onLog)
+                            val all = if (preferredSection != null && vres != null) {
+                                val scoped = ScreenVision.restrictCandidatesToSection(
+                                    driver,
+                                    all0,
+                                    vres,
+                                    preferredSection
+                                ) { it.xpath }
+                                onLog("vision:restrict section=$preferredSection from=${all0.size} to=${scoped.size}")
+                                scoped
+                            } else {
                                 applySectionScope(all0, preferredSection)
+                            }
 
                             val thAug = if (vres != null) th + "\n\nVISION_HINT::" + buildVisionHint(
                                 vres,
@@ -272,17 +289,29 @@ class AgentRunner(
 
                         onStatus("Checking \"$th\"")
                         ensureNotStopped()
-                        val p = findSwitchOrCheckableForLabel(th, preferredSection)
+
+                        // Vision-assisted toggle first
+                        val pVision = run {
+                            val v = analyzeWithVision("check.find", onLog)
+                            if (v == null) null else ScreenVision.findToggleForLabel(
+                                driver,
+                                v,
+                                th,
+                                preferredSection
+                            ) { onLog(it) }
+                        }
+
+                        val p = pVision ?: findSwitchOrCheckableForLabel(th, preferredSection)
                         if (p != null) {
                             val (loc, el) = p
                             val isChecked = (runCatching { el.getAttribute("checked") }.getOrNull() ?: "false") == "true"
                             val want = desired ?: !isChecked
                             if (isChecked != want) el.click()
-                            onLog("✓ checkbox/switch -> ${if (want) "ON" else "OFF"}")
+                            onLog("✓ checkbox/switch -> ${if (want) "ON" else "OFF"} (xpath=${loc.value})")
                             chosen = loc
                         } else {
                             val all = extractCandidatesForHint(driver, th, limit = 80)
-                            val v = analyzeWithYolo("check.hint", onLog)
+                            val v = analyzeWithVision("check.hint", onLog)
                             val thAug =
                                 if (v != null) th + "\n\nVISION_HINT::" + buildVisionHint(v, preferredSection) else th
                             val pickId = selector?.select(thAug, all)?.candidateId
@@ -431,6 +460,8 @@ class AgentRunner(
         return out
     }
 
+    // ---------- dialogs ----------
+
     private fun handleDialogWithPolling(
         stepIndex: Int,
         onLog: (String) -> Unit,
@@ -502,6 +533,8 @@ class AgentRunner(
         return DetectedDialog(title = title, message = message, buttons = buttons, rootXPath = rootXp)
     }
 
+    // ---------- xpath helpers ----------
+
     private data class ValidatedXPath(val xpath: String, val element: WebElement)
 
     private fun preMaterializeValidatedXPath(driver: AndroidDriver, original: Locator): ValidatedXPath? {
@@ -535,7 +568,12 @@ class AgentRunner(
             val texts = el.findElements(By.xpath(".//android.widget.TextView[normalize-space(@text)!='' and @clickable='false']"))
                 .mapNotNull { runCatching { it.text }.getOrNull()?.trim() }.filter { it.isNotEmpty() }.distinct()
             val titleish = texts.filter { it.length in 3..40 && !it.endsWith(".") && it.count { ch -> ch.isWhitespace() } <= 4 }.sortedBy { it.length }
-            val picks = buildList { addAll(titleish.take(3)); if (titleish.isEmpty() && texts.isNotEmpty()) add(texts.minBy { it.length }) }.distinct()
+            val picks = buildList {
+                addAll(titleish.take(3))
+                if (titleish.isEmpty() && texts.isNotEmpty()) {
+                    texts.minByOrNull { it.length }?.let { add(it) }
+                }
+            }.distinct()
             for (t in picks) {
                 out += "(//*[normalize-space(@text)=${xpathLiteral(t)}]/ancestor::*[@clickable='true'][1])"
                 out += "(" +
@@ -699,7 +737,10 @@ class AgentRunner(
         }
         fun inFrom(y: Int): Boolean {
             if (fromY == null && toY == null) return true
-            if (fromY != null && toY != null) return y in (min(fromY!!, toY!!) - 40)..(max(fromY!!, toY!!) - 40)
+            if (fromY != null && toY != null) return y in (kotlin.math.min(
+                fromY!!,
+                toY!!
+            ) - 40)..(kotlin.math.max(fromY!!, toY!!) - 40)
             if (fromY != null) return y >= fromY!! - 40
             return y >= toY!! - 40
         }
@@ -719,12 +760,6 @@ class AgentRunner(
     }
 
     private fun findSwitchOrCheckableForLabel(label: String, section: String?): Pair<Locator, WebElement>? {
-        val vres = analyzeWithYolo("toggle.find", onLog = { })
-        if (vres != null) {
-            val vr = ScreenVision.findToggleForLabel(driver, vres, label, section)
-            if (vr != null) return vr
-        }
-
         val lit = xpathLiteral(label.trim())
         val base = "//*[normalize-space(@text)=$lit]"
         val scoped = if (section == null) base else {
@@ -769,6 +804,18 @@ class AgentRunner(
     }
 
     private fun tryToggleByLabel(label: String, section: String?, desired: Boolean?, onLog: (String) -> Unit): Pair<Boolean, Locator?> {
+        // Vision-assisted mapping first
+        val vres = analyzeWithVision("toggle.find", onLog)
+        if (vres != null) {
+            val vr = ScreenVision.findToggleForLabel(driver, vres, label, section) { onLog(it) }
+            if (vr != null) {
+                val isChecked = (runCatching { vr.second.getAttribute("checked") }.getOrNull() ?: "false") == "true"
+                if (desired == null || isChecked != desired) runCatching { vr.second.click() }
+                return true to vr.first
+            }
+        }
+
+        // Fallback to pure UI-tree by label
         val pair = findSwitchOrCheckableForLabel(label, section) ?: return false to null
         val isChecked = (runCatching { pair.second.getAttribute("checked") }.getOrNull() ?: "false") == "true"
         if (desired == null) {
@@ -793,27 +840,130 @@ class AgentRunner(
         return "$head; $body"
     }
 
-    private fun analyzeWithYolo(tag: String, onLog: (String) -> Unit): VisionResult? {
+    private fun analyzeWithVision(tag: String, onLog: (String) -> Unit): VisionResult? {
         if (deki == null) {
-            onLog("yolo:$tag disabled")
-            return null
+            onLog("vision:$tag disabled"); return null
         }
+
+        val bytes = screenshotPng()
+        val h = java.util.Arrays.hashCode(bytes)
+        val now = System.currentTimeMillis()
+        if (h == lastVisionHash && (now - lastVisionTs) < 1500) {  // reuse for 1.5s
+            onLog("vision:$tag cache:hit")
+            return lastVision
+        }
+
         return try {
-            onLog("yolo:$tag analyze:start")
-            val res = deki.analyzePng(screenshotPng())
-            if (res == null) {
-                onLog("yolo:$tag analyze:null")
-            } else {
-                val textCount = res.elements.count {
-                    (it.text?.isNotBlank() == true) || (it.type?.lowercase() == "text") || it.id.lowercase()
-                        .contains("text")
-                }
-                onLog("yolo:$tag image=${res.imageW}x${res.imageH} items=${res.elements.size} texts=$textCount")
-            }
+            onLog("vision:$tag analyze:start")
+            val res = deki.analyzePngWithLogs(bytes, { m -> onLog(m) })
+            if (res == null) onLog("vision:$tag analyze:null")
+            lastVisionHash = h; lastVision = res; lastVisionTs = now
             res
         } catch (e: Throwable) {
-            onLog("yolo:$tag error=${e.message}")
+            onLog("vision:$tag error=${e.message}")
             null
         }
     }
+
+
+    private fun logVisionSummary(v: VisionResult, tag: String, onLog: (String) -> Unit) {
+        val texts = v.elements.count { (it.type ?: "").equals("text", true) || (it.text?.isNotBlank() == true) }
+        val sample = v.elements.asSequence()
+            .filter { it.text?.isNotBlank() == true }
+            .map { it.text!!.take(40).replace("\n", " ") }
+            .take(6).joinToString(" | ")
+        onLog("vision:$tag image=${v.imageW}x${v.imageH} items=${v.elements.size} texts=$texts sample=«$sample»")
+    }
+
+
+    private fun findClickableForLabelViaVision(
+        v: VisionResult,
+        label: String,
+        section: String?,
+        onLog: (String) -> Unit
+    ): Pair<Locator, WebElement>? {
+        val target = v.elements
+            .filter { (it.type ?: "").equals("text", true) && !it.text.isNullOrBlank() }
+            .maxByOrNull { textMatchScore(label, it.text!!) }
+            ?: return null.also { onLog("vision:label not found for '$label'") }
+
+        val bx = Box(target.x, target.y, target.w, target.h)
+        onLog("vision:label match text='${target.text}' at (${bx.x},${bx.y}) size=${bx.w}x${bx.h}")
+
+        // Search clickable DOM nodes and pick the one that best overlaps / is nearest
+        val clickables = driver.findElements(AppiumBy.xpath("//*[@clickable='true']"))
+        if (clickables.isEmpty()) return null.also { onLog("vision:no clickable DOM on screen") }
+
+        val best = clickables
+            .mapNotNull { el ->
+                val r = runCatching { el.rect }.getOrNull() ?: return@mapNotNull null
+                val cb = Box(r.x, r.y, r.width, r.height)
+                val s = visionHitScore(bx, cb, v.imageW, v.imageH)
+                s to el
+            }
+            .sortedByDescending { it.first }
+            .firstOrNull()
+
+        if (best == null || best.first < 0.05) {
+            onLog("vision:no strong clickable near label '$label'")
+            return null
+        }
+
+        val el = best.second
+        val xp = buildLocatorForClickable(el)
+        onLog("vision:clickable picked score=${"%.3f".format(best.first)} rect=${el.rect} xpath=$xp")
+        return Locator(Strategy.XPATH, xp) to el
+    }
+
+    private data class Box(val x: Int, val y: Int, val w: Int, val h: Int) {
+        val x2 get() = x + w
+        val y2 get() = y + h
+    }
+
+    private fun iou(a: Box, b: Box): Double {
+        val ix = maxOf(0, minOf(a.x2, b.x2) - maxOf(a.x, b.x))
+        val iy = maxOf(0, minOf(a.y2, b.y2) - maxOf(a.y, b.y))
+        val inter = ix * iy
+        val union = a.w * a.h + b.w * b.h - inter
+        return if (union <= 0) 0.0 else inter.toDouble() / union.toDouble()
+    }
+
+    private fun visionHitScore(labelBox: Box, domBox: Box, imgW: Int, imgH: Int): Double {
+        val i = iou(labelBox, domBox)
+        val lcX = labelBox.x + labelBox.w / 2.0
+        val lcY = labelBox.y + labelBox.h / 2.0
+        val dcX = domBox.x + domBox.w / 2.0
+        val dcY = domBox.y + domBox.h / 2.0
+        val dy = kotlin.math.abs(lcY - dcY) / imgH.toDouble()
+        val dx = kotlin.math.abs(lcX - dcX) / imgW.toDouble()
+        // Heuristic: prefer overlap, then closeness
+        return i * 3.0 + (1.0 - (dx + dy) / 2.0)
+    }
+
+    private fun textMatchScore(needle: String, hay: String): Int {
+        val a = needle.norm()
+        val b = hay.norm()
+        if (a == b) return 100
+        if (b.contains(a)) return 85
+        val at = a.split(' ')
+        val bt = b.split(' ')
+        val common = at.intersect(bt.toSet()).size
+        return 40 + common * 10 // coarse token overlap
+    }
+
+    private fun String.norm(): String =
+        lowercase().replace("&", " and ").replace(Regex("[\\p{Punct}]"), " ").replace(Regex("\\s+"), " ").trim()
+
+    private fun buildLocatorForClickable(el: WebElement): String {
+        val rid = runCatching { el.getAttribute("resource-id") }.getOrNull()?.trim().orEmpty()
+        if (rid.isNotEmpty()) return "//*[@resource-id=${xpathLiteral(rid)}]"
+        val txt = (runCatching { el.text }.getOrNull() ?: "").trim()
+        if (txt.isNotEmpty()) return "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
+        val desc = (runCatching { el.getAttribute("content-desc") }.getOrNull() ?: "").trim()
+        if (desc.isNotEmpty()) return "//*[@content-desc=${xpathLiteral(desc)}]"
+        // last resort: clickable class
+        val cls = (runCatching { el.getAttribute("className") }.getOrNull() ?: "").trim()
+        return if (cls.isNotEmpty()) "(//$cls[@clickable='true'])[1]" else "(//*[@clickable='true'])[1]"
+    }
+
 }

@@ -7,15 +7,14 @@ package agent.vision
 
 data class VisionElement(
     val id: String,
-    val type: String? = null,
-    val text: String? = null,
     val x: Int,
     val y: Int,
     val w: Int,
     val h: Int,
+    val type: String? = null,
+    val text: String? = null,
     val score: Double? = null
 )
-
 data class VisionResult(
     val imageW: Int,
     val imageH: Int,

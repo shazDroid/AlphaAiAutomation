@@ -2,84 +2,113 @@ package agent.vision
 
 import org.json.JSONArray
 import org.json.JSONObject
+import java.awt.image.BufferedImage
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.file.Files
 import java.util.UUID
+import javax.imageio.ImageIO
+import java.awt.Image as AwtImage
 
 class DekiYoloClient(
-    private val python: String = "python",
-    private val scriptPath: String = "BackEnd/deki_cli.py"
+    private val python: String = System.getenv("DEKI_PYTHON") ?: "python",
+    private val scriptPath: String = System.getenv("DEKI_CLI") ?: "BackEnd/deki_cli.py",
+    private val weightsPath: String? = System.getenv("DEKI_WEIGHTS"),
+    private val defaultImgWidth: Int = (System.getenv("DEKI_IMG_WIDTH")?.toIntOrNull() ?: 1280),
+    private val defaultImgSz: Int = (System.getenv("DEKI_NET_IMGSZ")?.toIntOrNull() ?: 640),
+    private val defaultConf: Float = (System.getenv("DEKI_CONF")?.toFloatOrNull() ?: 0.30f),
+    private val defaultOCR: Boolean = (System.getenv("DEKI_OCR")?.toIntOrNull() ?: 1) != 0
 ) {
-    init {
-        println("yolo:init python=$python script=$scriptPath script_exists=${File(scriptPath).exists()}")
+    /** Simple downscale-to-JPEG to speed up Python startup/io */
+    private fun toScaledJpeg(png: ByteArray, maxW: Int, quality: Float = 0.82f): ByteArray {
+        val img = ImageIO.read(ByteArrayInputStream(png))
+        val scale = if (img.width > maxW) maxW.toDouble() / img.width else 1.0
+        val w = (img.width * scale).toInt().coerceAtLeast(1)
+        val h = (img.height * scale).toInt().coerceAtLeast(1)
+        val scaled = BufferedImage(w, h, BufferedImage.TYPE_INT_RGB)
+        val g = scaled.createGraphics()
+        g.drawImage(img.getScaledInstance(w, h, AwtImage.SCALE_SMOOTH), 0, 0, null)
+        g.dispose()
+        val baos = ByteArrayOutputStream()
+        ImageIO.write(scaled, "jpg", baos) // keep it simple; JDK JPEG encoder
+        return baos.toByteArray()
     }
 
-    fun analyzePng(png: ByteArray): VisionResult? {
-        println("yolo:analyze:start")
+    fun analyzePngWithLogs(
+        png: ByteArray,
+        log: (String) -> Unit,
+        maxW: Int = defaultImgWidth,
+        imgsz: Int = defaultImgSz,
+        conf: Float = defaultConf,
+        ocr: Boolean = defaultOCR
+    ): VisionResult? {
+        // Prepare temp IO
         val workDir = Files.createTempDirectory("deki_local_${UUID.randomUUID()}").toFile()
-        val inPng = File(workDir, "in.png")
-        inPng.writeBytes(png)
+        val inImg = File(workDir, "in.jpg").apply { writeBytes(toScaledJpeg(png, maxW)) }
 
-        val pb = ProcessBuilder(listOf(python, scriptPath, "--in", inPng.absolutePath, "--out", workDir.absolutePath))
-        pb.redirectErrorStream(true)
+        // Build command
+        val cmd = mutableListOf(
+            python, scriptPath,
+            "--in", inImg.absolutePath,
+            "--out", workDir.absolutePath,
+            "--json-mini",
+            "--imgsz", imgsz.toString(),
+            "--conf", "%.2f".format(conf)
+        )
+        if (ocr) cmd += "--ocr"
+        weightsPath?.let { cmd += listOf("--weights", it) }
+
+        val scriptDir = File(scriptPath).parentFile
+        val pb = ProcessBuilder(cmd).redirectErrorStream(true)
+        if (scriptDir != null && scriptDir.exists()) {
+            pb.directory(scriptDir) // so relative weights next to script also work
+        }
+
+        log("yolo:cmd ${cmd.joinToString(" ")} (cwd=${pb.directory()?.absolutePath ?: "."})")
         val p = pb.start()
         val out = p.inputStream.bufferedReader(Charsets.UTF_8).readText()
         val code = p.waitFor()
-        println("yolo:analyze:exit=$code bytes_out=${out.length}")
-
-        // Clean up temporary files
-        runCatching { workDir.deleteRecursively() }
-
-        if (code != 0 || out.isBlank()) {
-            println("yolo:analyze:failed with exit code $code. Output: $out")
+        if (code != 0) {
+            log("yolo:fail exit=$code out=${out.take(600)}")
             return null
         }
+        log("yolo:ok stdout bytes=${out.length}")
 
-        val res = parse(out)
-        println("yolo:analyze:parsed elements=${res?.elements?.size ?: 0}")
+        // Try to extract the last JSON object from stdout, else read out.json
+        val jsonStdout = Regex("""(?s)\{.*\}\s*$""").find(out)?.value
+        val jsonFile = File(workDir, "out.json")
+        val json = when {
+            jsonStdout != null -> jsonStdout
+            jsonFile.exists() -> jsonFile.readText()
+            else -> out // hope it's pure JSON
+        }
+
+        val res = runCatching { parse(json) }.getOrNull()
+        if (res == null) log("yolo:parse:null")
+        else log("yolo:result image=${res.imageW}x${res.imageH} elements=${res.elements.size}")
         return res
     }
 
     private fun parse(json: String): VisionResult? {
-        // Your existing JSON parsing logic is robust and well-designed.
-        // It correctly handles different key names, so no changes are needed here.
         val o = JSONObject(json)
-        val iw = intPick(o, "imageW", "image_width", "width") ?: 0
-        val ih = intPick(o, "imageH", "image_height", "height") ?: 0
-        val arr = arrPick(o, "elements", "nodes", "detections") ?: JSONArray()
+        val iw = o.optInt("imageW", 0)
+        val ih = o.optInt("imageH", 0)
+        val arr = o.optJSONArray("elements") ?: JSONArray()
         val list = mutableListOf<VisionElement>()
         for (i in 0 until arr.length()) {
             val it = arr.optJSONObject(i) ?: continue
-            val id = strPick(it, "id", "name", "label") ?: "el_$i"
-            val x = intPick(it, "x", "left") ?: 0
-            val y = intPick(it, "y", "top") ?: 0
-            val w = intPick(it, "w", "width") ?: 0
-            val h = intPick(it, "h", "height") ?: 0
-            val text = strPick(it, "text", "string", "value")
-            val score = dblPick(it, "score", "confidence")
-            val type = strPick(it, "type", "kind", "cls")
-            list += VisionElement(id = id, type = type, text = text, x = x, y = y, w = w, h = h, score = score)
+            list += VisionElement(
+                id = it.optString("id", "el_$i"),
+                x = it.optInt("x", 0),
+                y = it.optInt("y", 0),
+                w = it.optInt("w", 0),
+                h = it.optInt("h", 0),
+                text = it.optString("text", null),
+                type = it.optString("type", null),
+                score = it.optDouble("score", Double.NaN).let { s -> if (s.isNaN()) null else s }
+            )
         }
         return VisionResult(iw, ih, list)
-    }
-
-    private fun strPick(o: JSONObject, vararg keys: String): String? {
-        for (k in keys) if (o.has(k) && !o.isNull(k)) return o.optString(k, null)
-        return null
-    }
-
-    private fun intPick(o: JSONObject, vararg keys: String): Int? {
-        for (k in keys) if (o.has(k) && !o.isNull(k)) return runCatching { o.getInt(k) }.getOrNull()
-        return null
-    }
-
-    private fun dblPick(o: JSONObject, vararg keys: String): Double? {
-        for (k in keys) if (o.has(k) && !o.isNull(k)) return runCatching { o.getDouble(k) }.getOrNull()
-        return null
-    }
-
-    private fun arrPick(o: JSONObject, vararg keys: String): JSONArray? {
-        for (k in keys) if (o.has(k) && !o.isNull(k)) return o.optJSONArray(k)
-        return null
     }
 }

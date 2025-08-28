@@ -7,134 +7,149 @@ import io.appium.java_client.android.AndroidDriver
 import org.openqa.selenium.WebElement
 import kotlin.math.abs
 import kotlin.math.max
-import kotlin.math.min
 
 /**
- * Helpers that blend vision detections with Appium DOM:
- * - narrow TAP candidates to a "FROM"/"TO" section
- * - find the switch/checkbox nearest to a label detected by vision
+ * Helpers to connect OCR (VisionResult) with the live DOM.
  */
 object ScreenVision {
 
     /**
-     * Keeps only those Appium candidates that visually land in the requested section,
-     * using "from" / "to" text y-anchors detected by vision.
-     */
-    fun restrictCandidatesToSection(
-        driver: AndroidDriver,
-        candidates: List<agent.candidates.UICandidate>,
-        vres: VisionResult,
-        section: String
-    ): List<agent.candidates.UICandidate> {
-        val fromY = vres.elements.firstOrNull { (it.text ?: "").equals("from", true) }?.y
-        val toY = vres.elements.firstOrNull { (it.text ?: "").equals("to", true) }?.y
-        if (fromY == null && toY == null) return candidates
-
-        fun inFrom(y: Int): Boolean {
-            if (fromY == null && toY == null) return true
-            if (fromY != null && toY != null) return y in (min(fromY, toY) - 40)..(max(fromY, toY) - 40)
-            if (fromY != null) return y >= fromY - 40
-            return y >= (toY ?: 0) - 40
-        }
-
-        fun inTo(y: Int): Boolean = if (toY != null) y >= toY - 40 else true
-
-        return candidates.filter { c ->
-            val rect = runCatching { driver.findElement(AppiumBy.xpath(c.xpath)).rect }.getOrNull()
-            if (rect == null) true else {
-                when (section.lowercase()) {
-                    "from" -> inFrom(rect.y)
-                    "to" -> inTo(rect.y)
-                    else -> true
-                }
-            }
-        }
-    }
-
-    /**
-     * Given a label string and vision result, find the nearest visible checkable UI (Switch/Checkbox)
-     * on the same row (by y-center proximity). Returns (Locator, WebElement) if found.
+     * Given a label (e.g., "Move all my money"), find the best OCR text match and
+     * then locate the nearest switch/checkbox to the right on the same row.
+     *
+     * Returns (Locator, WebElement) or null if not found.
      */
     fun findToggleForLabel(
         driver: AndroidDriver,
-        vres: VisionResult,
+        vr: VisionResult,
         label: String,
-        section: String?
+        section: String? = null,
+        onLog: ((String) -> Unit)? = null
     ): Pair<Locator, WebElement>? {
-        val lab = norm(label)
-
-        // Best matching vision text element for the given label
-        val labelElem = vres.elements
-            .filter { !it.text.isNullOrBlank() }
-            .maxByOrNull { scoreLabel(lab, it.text!!) }
-            ?: return null
-
-        // If the prompt said "FROM"/"TO", bias the chosen label by section anchors
-        val fromY = vres.elements.firstOrNull { (it.text ?: "").equals("from", true) }?.y
-        val toY = vres.elements.firstOrNull { (it.text ?: "").equals("to", true) }?.y
-        val labelYCenter = labelElem.y + labelElem.h / 2
-        val inFrom = section?.equals("from", true) == true && fromY != null &&
-                labelYCenter in (min(fromY, toY ?: fromY) - 80)..(max(fromY, toY ?: fromY) + 80)
-        val inTo = section?.equals("to", true) == true && toY != null &&
-                labelYCenter >= toY - 80
-
-        // Find nearest checkable element along the same row
-        val checkables = driver.findElements(
-            AppiumBy.xpath("//*[self::android.widget.Switch or @checkable='true']")
-        )
-        if (checkables.isEmpty()) return null
-
-        val best = checkables
-            .map { el ->
-                val yCenter = runCatching { el.rect.y + el.rect.height / 2 }.getOrNull() ?: 0
-                val xRight = runCatching { el.rect.x + el.rect.width }.getOrNull() ?: 0
-                Triple(el, abs(yCenter - labelYCenter), xRight)
-            }
-            // sort by y-distance, then prefer the rightmost element (common for toggles)
-            .sortedWith(compareBy<Triple<WebElement, Int, Int>>({ it.second }).thenByDescending { it.third })
-            .map { it.first }
-            .firstOrNull()
-            ?: return null
-
-        // If section was specified and the chosen element violates the section, bail out
-        if (section != null) {
-            val y = runCatching { best.rect.y + best.rect.height / 2 }.getOrNull() ?: 0
-            val ok = when (section.lowercase()) {
-                "from" -> fromY == null || y >= fromY - 80
-                "to" -> toY == null || y >= toY - 80
-                else -> true
-            }
-            if (!ok) return null
+        val t = bestTextMatch(vr, label) ?: run {
+            onLog?.invoke("vision:toggle label '$label' not found in vision elements")
+            return null
         }
 
-        val xp = locatorFor(best)
-        return Locator(Strategy.XPATH, xp) to best
+        onLog?.invoke("vision:label match text='${t.text}' at (${t.x},${t.y}) size=${t.w}x${t.h}")
+
+        // Define a horizontal "row" around the matched text and prefer elements to the right of it.
+        val rowTop = t.y - 48
+        val rowBottom = t.y + t.h + 48
+        val minRightX = t.x + t.w - 4
+
+        // Candidate DOM nodes that could be toggles/switches/checkboxes.
+        val xp = "(.//*[@checkable='true' or self::android.widget.Switch " +
+                "or contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'switch') " +
+                "or contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'toggle') " +
+                "or contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'switch') " +
+                "or contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'toggle')])"
+
+        val nodes = driver.findElements(AppiumBy.xpath(xp))
+        if (nodes.isEmpty()) {
+            onLog?.invoke("vision: no checkable DOM nodes near label '${t.text}'")
+            return null
+        }
+
+        data class DomCand(val el: WebElement, val score: Int)
+
+        val textCy = t.y + t.h / 2
+        val candidates = nodes.mapNotNull { el ->
+            val r = runCatching { el.rect }.getOrNull() ?: return@mapNotNull null
+            val cy = r.y + r.height / 2
+            val sameRow = cy in rowTop..rowBottom
+            val rightSide = r.x >= minRightX
+            if (!sameRow || !rightSide) return@mapNotNull null
+
+            // Scoring: prefer closer vertical center; slight bias to nearer in X too.
+            val score = abs(cy - textCy) * 3 + max(0, r.x - minRightX)
+            DomCand(el, score)
+        }.sortedBy { it.score }
+
+        val best = candidates.firstOrNull() ?: run {
+            onLog?.invoke("vision: no right-side toggle in same row for '${t.text}'")
+            return null
+        }
+
+        val xpLoc = buildLocatorForElement(best.el)
+        onLog?.invoke(
+            "vision:toggle picked DOM rid='${safeAttr(best.el, "resource-id")}', desc='${
+                safeAttr(
+                    best.el,
+                    "content-desc"
+                )
+            }', text='${safeAttr(best.el, "text")}', xpath=$xpLoc"
+        )
+        return Locator(Strategy.XPATH, xpLoc) to best.el
     }
 
-    // --- helpers ---
+    /**
+     * Use OCR anchors "from"/"to" to keep candidates within matching section, if available.
+     * Falls back to returning 'all' when anchors are not found.
+     */
+    fun <T> restrictCandidatesToSection(
+        driver: AndroidDriver,
+        all: List<T>,
+        vr: VisionResult,
+        section: String,
+        getXpath: (T) -> String
+    ): List<T> {
+        val anchorY = when (section.lowercase()) {
+            "from" -> firstY(vr, "from")
+            "to" -> firstY(vr, "to")
+            else -> null
+        } ?: return all
 
-    private fun norm(s: String): String =
-        s.lowercase()
-            .replace("&", " and ")
-            .replace(Regex("[\\p{Punct}]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-    private fun scoreLabel(needle: String, hay: String): Int {
-        val h = norm(hay)
-        if (h == needle) return 3
-        if (h.contains(needle)) return 2
-        val toks = needle.split(" ").filter { it.isNotBlank() }
-        val hit = toks.count { h.contains(it) }
-        return if (hit >= toks.size.coerceAtLeast(1)) 1 else 0
+        return all.filter { item ->
+            val rect = runCatching { driver.findElement(AppiumBy.xpath(getXpath(item))).rect }.getOrNull()
+            rect?.y?.let { it >= anchorY - 40 } ?: true
+        }
     }
 
-    private fun locatorFor(el: WebElement): String {
-        val rid = runCatching { el.getAttribute("resource-id") }.getOrNull()?.takeIf { it.isNotBlank() }
-        if (rid != null) return "//*[@resource-id='$rid']"
-        val txt = runCatching { el.text }.getOrNull()?.trim().orEmpty()
-        if (txt.isNotEmpty()) return "//*[normalize-space(@text)='${txt.replace("'", "’")}']"
-        val clickable = runCatching { el.getAttribute("clickable") }.getOrNull()
-        return if (clickable == "true") "(//*[@clickable='true'])[1]" else "//*[@checkable='true'][1]"
+    private fun firstY(vr: VisionResult, token: String): Int? =
+        vr.elements.firstOrNull { it.text?.equals(token, ignoreCase = true) == true }?.y
+
+    /** Pick the OCR element that best matches the label. */
+    fun bestTextMatch(vr: VisionResult, label: String): VisionElement? =
+        vr.elements
+            .asSequence()
+            .filter { it.text?.isNotBlank() == true }
+            .map { it to scoreText(it.text!!, label) }
+            .maxByOrNull { it.second }
+            ?.takeIf { it.second >= 0.50 }
+            ?.first
+
+    /** Soft string scoring that rewards full/partial token overlaps and contains() matches. */
+    private fun scoreText(a: String, b: String): Double {
+        val aa = norm(a);
+        val bb = norm(b)
+        if (aa == bb || aa.contains(bb) || bb.contains(aa)) return 1.0
+        val at = aa.split(' ').filter { it.isNotBlank() }.toSet()
+        val bt = bb.split(' ').filter { it.isNotBlank() }.toSet()
+        val overlap = at.intersect(bt).size.toDouble()
+        val union = (at + bt).toSet().size.coerceAtLeast(1).toDouble()
+        return overlap / union
+    }
+
+    private fun norm(s: String) = s.lowercase().replace(Regex("\\s+"), " ").trim()
+
+    private fun buildLocatorForElement(el: WebElement): String {
+        val rid = safeAttr(el, "resource-id")
+        if (rid.isNotBlank()) return "//*[@resource-id=${xpathLiteral(rid)}]"
+        val desc = safeAttr(el, "content-desc")
+        if (desc.isNotBlank()) return "//*[@content-desc=${xpathLiteral(desc)}]"
+        val txt = safeAttr(el, "text")
+        if (txt.isNotBlank()) return "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
+        // very last resort
+        return "(.//*[@checkable='true' or self::android.widget.Switch])[1]"
+    }
+
+    private fun safeAttr(el: WebElement, name: String): String =
+        runCatching { el.getAttribute(name) }.getOrNull()?.trim().orEmpty()
+
+    private fun xpathLiteral(s: String): String = when {
+        '\'' !in s -> "'$s'"
+        '"' !in s -> "\"$s\""
+        else -> "concat('${s.replace("'", "',\"'\",'")}')"
     }
 }

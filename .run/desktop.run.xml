@@ -1,6 +1,16 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="desktop" type="GradleRunConfiguration" factoryName="Gradle">
     <ExternalSystemSettings>
+        <option name="env">
+            <map>
+                <entry key="DEKI_CLI" value="D:\Alpha UI Automation\BackEnd\deki_cli.py"/>
+                <entry key="DEKI_CONF" value="0.40"/>
+                <entry key="DEKI_IMG_WIDTH" value="800"/>
+                <entry key="DEKI_NET_IMGSZ" value="512"/>
+                <entry key="DEKI_PYTHON" value="C:\Python312\python.exe"/>
+                <entry key="DEKI_WEIGHTS" value="D:\Alpha UI Automation\BackEnd\best.pt"/>
+            </map>
+        </option>
       <option name="executionName" />
       <option name="externalProjectPath" value="$PROJECT_DIR$" />
       <option name="externalSystemIdString" value="GRADLE" />
