@@ -36,6 +36,7 @@ dependencies {
 
     // XML parsing
     implementation("org.jsoup:jsoup:1.18.1")
+    implementation("org.json:json:20240303")
 
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")

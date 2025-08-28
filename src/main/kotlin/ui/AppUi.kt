@@ -10,6 +10,7 @@ import agent.LocatorResolver
 import agent.Snapshot
 import agent.SnapshotStore
 import agent.llm.LlmDisambiguator
+import agent.vision.DekiYoloClient
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.desktop.ui.tooling.preview.Preview
 import androidx.compose.foundation.*
@@ -995,13 +996,18 @@ fun AgentComponent(
 
                             val resolver = LocatorResolver(driver, onLog)
                             val store = SnapshotStore(driver, File("runs/${System.currentTimeMillis()}"))
+                            val dekiClient = DekiYoloClient(
+                                python = "C:\\Python312\\python.exe",
+                                scriptPath = "D:\\Alpha UI Automation\\BackEnd\\deki_cli.py"
+                            )
 
                             val result = AgentRunner(
                                 driver = driver,
                                 resolver = resolver,
                                 store = store,
                                 llmDisambiguator = llmDisambiguator,
-                                semanticReranker
+                                semanticReranker = semanticReranker,
+                                deki = dekiClient
                             ).run(
                                 plan = p,
                                 onStep = { snap ->
