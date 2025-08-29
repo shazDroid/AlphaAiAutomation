@@ -20,6 +20,9 @@ class SnapshotStore(
     private val driver: AndroidDriver,
     private val dir: File
 ) {
+
+    private val meta: MutableMap<String, String> = mutableMapOf()
+
     init { dir.mkdirs() }
 
     fun capture(stepIndex: Int, action: StepType, hint: String?, locator: Locator?, success: Boolean, notes: String?): Snapshot {
@@ -29,4 +32,15 @@ class SnapshotStore(
         val pngPath = File(dir, "step_${stepIndex}.png").apply { writeBytes(bytes) }.absolutePath
         return Snapshot(stepIndex, action, hint, locator, xmlPath, pngPath, success, notes)
     }
+
+    fun attachMeta(key: String, value: String) {
+        meta[key] = value
+    }
+
+    fun meta(key: String): String? = meta[key]
+
+    fun noteSelector(label: String, selector: String) {
+        attachMeta("selector:$label", selector)
+    }
+
 }

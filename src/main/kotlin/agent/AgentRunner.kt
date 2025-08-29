@@ -155,7 +155,6 @@ class AgentRunner(
                         onStatus("Tapping \"$th\"")
                         ensureNotStopped()
 
-                        // 0) Section-aware direct text tap (handles duplicates under FROM/TO)
                         if (effectiveSection != null) {
                             val tapped = tapByTextInSection(th, effectiveSection, onLog)
                             if (tapped != null) {
@@ -166,7 +165,35 @@ class AgentRunner(
                             }
                         }
 
-                        // 1) Vision-first (for widgets like toggles)
+                        run {
+                            val fast = resolver.findSwitchOrCheckableForLabel(th, effectiveSection)
+                            if (fast != null) {
+                                val before = safePageSourceHash()
+                                val el = runCatching { driver.findElement(AppiumBy.xpath(fast.value)) }.getOrNull()
+                                if (el != null) {
+                                    el.click()
+                                    chosen = fast
+                                    lastTapY = runCatching { el.rect.let { it.y + it.height / 2 } }.getOrNull()
+                                    val vtmp = analyzeWithVisionFast("tap.fast.after", onLog, effectiveSection)
+                                    setScope(determineScopeByY(lastTapY, vtmp) ?: activeScope)
+                                    val dialogHandled = runCatching {
+                                        handleDialogWithPolling(
+                                            step.index,
+                                            onLog,
+                                            onStatus,
+                                            1600L
+                                        )
+                                    }.getOrDefault(false)
+                                    val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
+                                    if (uiChanged) {
+                                        val snap =
+                                            store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                        out += snap; onStep(snap); pc += 1; return@run
+                                    }
+                                }
+                            }
+                        }
+
                         val handledByVision: Boolean = run {
                             var vres = analyzeWithVisionFast("tap.pre", onLog, effectiveSection)
                             val labelFound =
@@ -205,7 +232,6 @@ class AgentRunner(
                         }
                         if (handledByVision) continue
 
-                        // 2) Legacy toggle-by-label (DOM)
                         val toggleHit = tryToggleByLabel(th, preferredSection, desiredToggle, onLog)
                         if (toggleHit.first) {
                             chosen = toggleHit.second
@@ -215,7 +241,6 @@ class AgentRunner(
                             out += snap; onStep(snap); pc += 1; continue
                         }
 
-                        // 3) Candidate search + exact + LLM + semantic (with section scoping)
                         val deadline = System.currentTimeMillis() + timeout
                         var changed = false
                         var tappedLocator: Locator? = null
@@ -299,16 +324,27 @@ class AgentRunner(
                         }
 
                         if (!changed) {
+                            val beforeXml = runCatching { driver.pageSource }.getOrNull()
+                            val beforeHash = safePageSourceHash()
                             onStatus("""ACTION_REQUIRED::Tap "$th" on the device""")
                             onLog("  waiting up to 12s for manual tap…")
-                            val manual = waitUiChangedSince(safePageSourceHash(), 12_000L)
+                            val manual = waitUiChangedSince(beforeHash, 12_000L)
                             if (!manual) throw IllegalStateException("Tap timeout: \"$th\"${lastScanError?.let { " ($it)" } ?: ""}")
+                            val afterXml = runCatching { driver.pageSource }.getOrNull()
+
+                            val post = resolver.findSwitchOrCheckableForLabel(th, effectiveSection)
+                                ?: resolver.resolveChangedCheckableByDiff(beforeXml, afterXml, th, effectiveSection)
+                                ?: resolver.findRightSideClickableForLabel(th, effectiveSection)
+
+                            tappedLocator = post ?: tappedLocator
                         }
 
                         chosen = tappedLocator
                         onLog("✓ tapped")
                         handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
+
                     }
+
 
                     StepType.CHECK -> {
                         refreshScopeIfHeadersGone(onLog)

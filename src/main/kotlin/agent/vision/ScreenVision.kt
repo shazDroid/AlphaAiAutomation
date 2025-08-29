@@ -5,8 +5,6 @@ import agent.Strategy
 import io.appium.java_client.AppiumBy
 import io.appium.java_client.android.AndroidDriver
 import org.openqa.selenium.WebElement
-import kotlin.math.abs
-import kotlin.math.max
 
 /**
  * Helpers to connect OCR (VisionResult) with the live DOM.
@@ -33,36 +31,36 @@ object ScreenVision {
 
         onLog?.invoke("vision:label match text='${t.text}' at (${t.x},${t.y}) size=${t.w}x${t.h}")
 
-        // Define a horizontal "row" around the matched text and prefer elements to the right of it.
-        val rowTop = t.y - 48
-        val rowBottom = t.y + t.h + 48
-        val minRightX = t.x + t.w - 4
-
         // Candidate DOM nodes that could be toggles/switches/checkboxes.
-        val xp = "(.//*[@checkable='true' or self::android.widget.Switch " +
-                "or contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'switch') " +
-                "or contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'toggle') " +
-                "or contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'switch') " +
-                "or contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'toggle')])"
+        val xp =
+            "(.//*[" +
+                    "@checkable='true' or " +
+                    "contains(@class,'Switch') or contains(@class,'SwitchCompat') or " +
+                    "contains(@class,'MaterialSwitch') or contains(@class,'Toggle') or " +
+                    "contains(@class,'Radio') or contains(@class,'CheckBox') or " +
+                    "contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'switch') or " +
+                    "contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'toggle') or " +
+                    "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'switch') or " +
+                    "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'toggle')" +
+                    "])"
 
         val nodes = driver.findElements(AppiumBy.xpath(xp))
-        if (nodes.isEmpty()) {
-            onLog?.invoke("vision: no checkable DOM nodes near label '${t.text}'")
-            return null
-        }
+        if (nodes.isEmpty()) return null
 
         data class DomCand(val el: WebElement, val score: Int)
 
         val textCy = t.y + t.h / 2
+        val textRightEdge = t.x + t.w - 4
+        val rowTop = t.y - 48
+        val rowBottom = t.y + t.h + 48
+
         val candidates = nodes.mapNotNull { el ->
             val r = runCatching { el.rect }.getOrNull() ?: return@mapNotNull null
             val cy = r.y + r.height / 2
             val sameRow = cy in rowTop..rowBottom
-            val rightSide = r.x >= minRightX
+            val rightSide = r.x >= textRightEdge
             if (!sameRow || !rightSide) return@mapNotNull null
-
-            // Scoring: prefer closer vertical center; slight bias to nearer in X too.
-            val score = abs(cy - textCy) * 3 + max(0, r.x - minRightX)
+            val score = kotlin.math.abs(cy - textCy) * 3 + kotlin.math.max(0, r.x - textRightEdge)
             DomCand(el, score)
         }.sortedBy { it.score }
 
