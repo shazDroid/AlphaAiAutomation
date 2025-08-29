@@ -9,6 +9,7 @@ import agent.IntentParser
 import agent.LocatorResolver
 import agent.Snapshot
 import agent.SnapshotStore
+import agent.llm.GeminiDisambiguator
 import agent.llm.LlmDisambiguator
 import agent.vision.DekiYoloClient
 import androidx.compose.animation.AnimatedVisibility
@@ -1001,11 +1002,16 @@ fun AgentComponent(
                                 scriptPath = "D:\\Alpha UI Automation\\BackEnd\\deki_cli.py"
                             )
 
+                            val gemini = GeminiDisambiguator(
+                                apiKey = System.getenv("GEMINI_API_KEY") ?: "AIzaSyBAB1n3XuO7Ra1wfrZNXPTWJRigDNvPtbE",
+                                model = System.getenv("GEMINI_MODEL") ?: "gemini-2.5-flash-lite"
+                            )
+
                             val result = AgentRunner(
                                 driver = driver,
                                 resolver = resolver,
                                 store = store,
-                                llmDisambiguator = llmDisambiguator,
+                                llmDisambiguator = gemini,
                                 semanticReranker = semanticReranker,
                                 deki = dekiClient
                             ).run(

@@ -1,6 +1,9 @@
 package adb
 
+import io.appium.java_client.AppiumBy
+import io.appium.java_client.android.AndroidDriver
 import model.UiElement
+import org.openqa.selenium.WebElement
 import org.w3c.dom.Document
 import org.w3c.dom.Node
 import java.io.BufferedReader
@@ -80,38 +83,72 @@ object UiDumpParser {
     /**
      * Find EditText associated with a label TextView having given target text.
      */
-    fun findEditTextForLabel(xml: String, targetText: String): UiElement? {
-        val dbFactory = DocumentBuilderFactory.newInstance()
-        val dBuilder = dbFactory.newDocumentBuilder()
-        val doc: Document = dBuilder.parse(ByteArrayInputStream(xml.toByteArray()))
-        val nodeList = doc.getElementsByTagName("node")
+    fun findEditTextForLabel(
+        driver: AndroidDriver,
+        labelText: String,
+        hint: String,
+        log: (String) -> Unit
+    ): Pair<String, WebElement> {
+        fun lowerLit(s: String) = xpathLiteral(s.lowercase())
+        val needle = labelText.trim().lowercase()
 
-        for (i in 0 until nodeList.length) {
-            val node = nodeList.item(i)
-            val attrs = node.attributes
-            val clazz = attrs.getNamedItem("class")?.nodeValue ?: ""
-            val text = attrs.getNamedItem("text")?.nodeValue ?: ""
+        fun passwordXpath(): String =
+            "(//android.widget.EditText[@password='true' or contains(@input-type,'128') or " +
+                    "contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'password') or " +
+                    "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'password')])[1]"
 
-            if (clazz == "android.widget.TextView" && text == targetText) {
-                val containerNode = findEnclosingViewGroup(node)
-                val editTextNode = containerNode?.let { findChildEditText(it) }
-                if (editTextNode != null) {
-                    return editTextNode.toUiElement()
-                }
+        if (needle.contains("pass")) {
+            val xpPwd = passwordXpath()
+            driver.findElements(AppiumBy.xpath(xpPwd)).firstOrNull()?.let { ed -> return xpPwd to ed }
+        }
+
+        runCatching {
+            val xpContainer =
+                "(//*[@resource-id and .//*[contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), ${
+                    lowerLit(
+                        needle
+                    )
+                })]])[1]"
+            driver.findElements(AppiumBy.xpath(xpContainer)).firstOrNull()?.let {
+                val xp = "($xpContainer//android.widget.EditText)[1]"
+                driver.findElements(AppiumBy.xpath(xp)).firstOrNull()?.let { ed -> return xp to ed }
             }
         }
 
-
-        for (i in 0 until nodeList.length) {
-            val node = nodeList.item(i)
-            val clazz = node.attributes?.getNamedItem("class")?.nodeValue ?: ""
-            if (clazz == "android.widget.EditText") {
-                return node.toUiElement()
-            }
+        runCatching {
+            val xpFollowing =
+                "(//*[contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), ${
+                    lowerLit(
+                        needle
+                    )
+                })])[1]/following::android.widget.EditText[1]"
+            driver.findElements(AppiumBy.xpath(xpFollowing)).firstOrNull()?.let { ed -> return xpFollowing to ed }
         }
 
-        return null
+        runCatching {
+            val xpPwd = passwordXpath()
+            driver.findElements(AppiumBy.xpath(xpPwd)).firstOrNull()?.let { ed -> return xpPwd to ed }
+        }
+
+        val all = driver.findElements(AppiumBy.xpath("//android.widget.EditText"))
+        if (all.size == 1) {
+            val xp = "(//android.widget.EditText)[1]"; return xp to all.first()
+        }
+        if (all.isNotEmpty()) {
+            val idx = if (hint.contains("pass", ignoreCase = true)) all.size else 1
+            val xpIndex = "(//android.widget.EditText)[$idx]"
+            driver.findElements(AppiumBy.xpath(xpIndex)).firstOrNull()?.let { ed -> return xpIndex to ed }
+        }
+
+        throw IllegalStateException("EditText not found for label \"$labelText\"")
     }
+
+    fun xpathLiteral(s: String): String = when {
+        '\'' !in s -> "'$s'"
+        '"' !in s -> "\"$s\""
+        else -> "concat('${s.replace("'", "',\"'\",'")}')"
+    }
+
 
     private fun findEnclosingViewGroup(node: Node): Node? {
         var current = node.parentNode

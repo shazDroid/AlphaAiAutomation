@@ -4,9 +4,9 @@
         <option name="env">
             <map>
                 <entry key="DEKI_CLI" value="D:\Alpha UI Automation\BackEnd\deki_cli.py"/>
-                <entry key="DEKI_CONF" value="0.40"/>
-                <entry key="DEKI_IMG_WIDTH" value="800"/>
-                <entry key="DEKI_NET_IMGSZ" value="512"/>
+                <entry key="DEKI_CONF" value="0.25"/>
+                <entry key="DEKI_IMG_WIDTH" value="480"/>
+                <entry key="DEKI_NET_IMGSZ" value="320"/>
                 <entry key="DEKI_PYTHON" value="C:\Python312\python.exe"/>
                 <entry key="DEKI_WEIGHTS" value="D:\Alpha UI Automation\BackEnd\best.pt"/>
             </map>

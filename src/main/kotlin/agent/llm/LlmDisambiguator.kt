@@ -38,7 +38,7 @@ data class LlmScreenContext(
     val activity: String? = null,      // driver.currentActivity if you want
 )
 
-class LlmDisambiguator(
+open class LlmDisambiguator(
     private val ollama: OllamaClient
 ) {
     private val mapper = jacksonObjectMapper()
@@ -47,7 +47,11 @@ class LlmDisambiguator(
      * Ask the LLM to choose one candidate id.
      * If anything goes wrong, return null (caller will fall back deterministically).
      */
-    fun decide(hint: String, candidates: List<LlmUiCandidate>, ctx: LlmScreenContext = LlmScreenContext()): String? {
+    open fun decide(
+        hint: String,
+        candidates: List<LlmUiCandidate>,
+        ctx: LlmScreenContext = LlmScreenContext()
+    ): String? {
         if (candidates.isEmpty()) return null
 
         // Keep payload tiny & deterministic
