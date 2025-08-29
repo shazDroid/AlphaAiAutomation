@@ -213,8 +213,6 @@ class AgentRunner(
 
                             lastTapY = runCatching { vr.second.rect.let { it.y + it.height / 2 } }.getOrNull()
                             setScope(determineScopeByY(lastTapY, vres) ?: activeScope)
-                            onLog("scope:update after tap → ${activeScope ?: "-"}")
-
                             val dialogHandled = runCatching {
                                 handleDialogWithPolling(
                                     step.index,
@@ -225,7 +223,6 @@ class AgentRunner(
                             }.getOrDefault(false)
                             val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
                             if (uiChanged) {
-                                onLog("vision:tap.success xpath=${vr.first.value}")
                                 val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
                                 out += snap; onStep(snap); pc += 1; true
                             } else false
@@ -235,7 +232,6 @@ class AgentRunner(
                         val toggleHit = tryToggleByLabel(th, preferredSection, desiredToggle, onLog)
                         if (toggleHit.first) {
                             chosen = toggleHit.second
-                            onLog("✓ toggled (legacy)")
                             handleDialogWithPolling(step.index, onLog, onStatus, 1400L)
                             val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
                             out += snap; onStep(snap); pc += 1; continue
@@ -267,10 +263,7 @@ class AgentRunner(
                             fun norm(s: String?) = normalize(s)
                             val exact = all.filter { norm(it.label) == norm(th) }.toMutableList()
                             val ordered = mutableListOf<UICandidate>()
-                            if (exact.isNotEmpty()) {
-                                ordered += preferByRolePosAndHeader(exact, effectiveSection, vres)
-                                onLog("pick:exact ${ordered.first().label}")
-                            }
+                            if (exact.isNotEmpty()) ordered += preferByRolePosAndHeader(exact, effectiveSection, vres)
 
                             if (ordered.isEmpty()) {
                                 val visionHint = vres?.let { buildVisionHint(it, effectiveSection) } ?: "-"
@@ -281,10 +274,7 @@ class AgentRunner(
                                 }
                                 val pick = sel.select(instructionForSelector, all)
                                 pick.candidateId?.let { cid ->
-                                    all.firstOrNull { it.id == cid }?.let { choice ->
-                                        onLog("llm_pick=${choice.id} label='${choice.label}' scope=${pick.scope} op=${pick.op}")
-                                        ordered += choice
-                                    }
+                                    all.firstOrNull { it.id == cid }?.let { choice -> ordered += choice }
                                 }
                             }
 
@@ -310,7 +300,6 @@ class AgentRunner(
                                 lastTapY = runCatching { el.rect.let { it.y + it.height / 2 } }.getOrNull()
                                 val vtmp = vres ?: analyzeWithVision("tap.after", onLog)
                                 setScope(determineScopeByY(lastTapY, vtmp) ?: activeScope)
-                                onLog("scope:update after tap → ${activeScope ?: "-"}")
                                 tappedLocator = validated?.toLocatorWith(loc) ?: loc
                                 val dialogHandled = runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }.getOrDefault(false)
                                 val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
@@ -339,10 +328,15 @@ class AgentRunner(
                             tappedLocator = post ?: tappedLocator
                         }
 
-                        chosen = tappedLocator
+                        chosen = tappedLocator ?: resolver.findSwitchOrCheckableForLabel(th, effectiveSection)
+                                ?: resolver.findRightSideClickableForLabel(th, effectiveSection)
+                                ?: chosen
+
+                        if (chosen == null) throw IllegalStateException("Recorded selector missing after tap for \"$th\"")
                         onLog("✓ tapped")
                         handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
-
+                        val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                        out += snap; onStep(snap); pc += 1; continue
                     }
 
 

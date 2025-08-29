@@ -5,6 +5,8 @@ import agent.Strategy
 import io.appium.java_client.AppiumBy
 import io.appium.java_client.android.AndroidDriver
 import org.openqa.selenium.WebElement
+import kotlin.math.abs
+import kotlin.math.max
 
 /**
  * Helpers to connect OCR (VisionResult) with the live DOM.
@@ -29,57 +31,81 @@ object ScreenVision {
             return null
         }
 
-        onLog?.invoke("vision:label match text='${t.text}' at (${t.x},${t.y}) size=${t.w}x${t.h}")
+        val rowTop = t.y - max(48, t.h / 2)
+        val rowBottom = t.y + t.h + max(48, t.h / 2)
+        val midRight = t.x + (t.w * 3) / 5
+        val textCy = t.y + t.h / 2
 
-        // Candidate DOM nodes that could be toggles/switches/checkboxes.
         val xp =
             "(.//*[" +
-                    "@checkable='true' or " +
+                    "@checkable='true' or @clickable='true' or @long-clickable='true' or " +
                     "contains(@class,'Switch') or contains(@class,'SwitchCompat') or " +
                     "contains(@class,'MaterialSwitch') or contains(@class,'Toggle') or " +
-                    "contains(@class,'Radio') or contains(@class,'CheckBox') or " +
+                    "contains(@class,'Radio') or contains(@class,'Check') or " +
                     "contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'switch') or " +
                     "contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'toggle') or " +
-                    "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'switch') or " +
-                    "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'toggle')" +
+                    "contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'radio')" +
                     "])"
 
         val nodes = driver.findElements(AppiumBy.xpath(xp))
-        if (nodes.isEmpty()) return null
 
         data class DomCand(val el: WebElement, val score: Int)
-
-        val textCy = t.y + t.h / 2
-        val textRightEdge = t.x + t.w - 4
-        val rowTop = t.y - 48
-        val rowBottom = t.y + t.h + 48
 
         val candidates = nodes.mapNotNull { el ->
             val r = runCatching { el.rect }.getOrNull() ?: return@mapNotNull null
             val cy = r.y + r.height / 2
+            val cx = r.x + r.width / 2
             val sameRow = cy in rowTop..rowBottom
-            val rightSide = r.x >= textRightEdge
+            val rightSide = cx > midRight
             if (!sameRow || !rightSide) return@mapNotNull null
-            val score = kotlin.math.abs(cy - textCy) * 3 + kotlin.math.max(0, r.x - textRightEdge)
-            DomCand(el, score)
+            val dy = abs(cy - textCy)
+            val dx = max(0, cx - midRight)
+            val cls = runCatching { el.getAttribute("class") }.getOrNull().orEmpty()
+            val checkable = runCatching { el.getAttribute("checkable") }.getOrNull() == "true"
+            val weight =
+                when {
+                    cls.contains("MaterialSwitch", true) -> 0
+                    cls.contains("SwitchCompat", true) -> 1
+                    cls.contains("Switch", true) -> 2
+                    cls.contains("CheckBox", true) -> 4
+                    cls.contains("Radio", true) -> 5
+                    else -> 6
+                } - if (checkable) 1 else 0
+            DomCand(el, dy * 6 + dx * 2 + weight)
         }.sortedBy { it.score }
 
-        val best = candidates.firstOrNull() ?: run {
-            onLog?.invoke("vision: no right-side toggle in same row for '${t.text}'")
-            return null
+        val picked: WebElement? = candidates.firstOrNull()?.el ?: run {
+            val lower = label.lowercase()
+            val labelXpath =
+                "//*[contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${xpathLiteral(lower)}) or " +
+                        "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${xpathLiteral(lower)})]"
+            val labelEls = driver.findElements(AppiumBy.xpath(labelXpath))
+            val anchor = labelEls.firstOrNull() ?: return null
+            val ar = runCatching { anchor.rect }.getOrNull() ?: return null
+            val ay = ar.y + ar.height / 2
+            val axRight = ar.x + (ar.width * 3) / 5
+            val rowMin = ar.y - max(48, ar.height / 2)
+            val rowMax = ar.y + ar.height + max(48, ar.height / 2)
+            val cands = driver.findElements(AppiumBy.xpath("//*[@clickable='true' or @checkable='true']"))
+            cands.mapNotNull { el ->
+                val rr = runCatching { el.rect }.getOrNull() ?: return@mapNotNull null
+                val cy = rr.y + rr.height / 2
+                val cx = rr.x + rr.width / 2
+                val sameRow = cy in rowMin..rowMax
+                val rightSide = cx > axRight
+                if (!sameRow || !rightSide) null else DomCand(el, abs(cy - ay) * 6 + max(0, cx - axRight) * 2)
+            }.sortedBy { it.score }
+                .firstOrNull()
+                ?.el
         }
 
-        val xpLoc = buildLocatorForElement(best.el)
-        onLog?.invoke(
-            "vision:toggle picked DOM rid='${safeAttr(best.el, "resource-id")}', desc='${
-                safeAttr(
-                    best.el,
-                    "content-desc"
-                )
-            }', text='${safeAttr(best.el, "text")}', xpath=$xpLoc"
-        )
-        return Locator(Strategy.XPATH, xpLoc) to best.el
+        if (picked == null) return null
+        val locator = Locator(Strategy.XPATH, buildLocatorForElement(picked))
+        onLog?.invoke("vision:toggle picked xpath=${locator.value}")
+        return locator to picked
+
     }
+
 
     /**
      * Use OCR anchors "from"/"to" to keep candidates within matching section, if available.
@@ -138,9 +164,11 @@ object ScreenVision {
         if (desc.isNotBlank()) return "//*[@content-desc=${xpathLiteral(desc)}]"
         val txt = safeAttr(el, "text")
         if (txt.isNotBlank()) return "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
-        // very last resort
-        return "(.//*[@checkable='true' or self::android.widget.Switch])[1]"
+        val cls = safeAttr(el, "class")
+        if (cls.isNotBlank()) return "//*[@class=${xpathLiteral(cls)}][last()]"
+        return "(.//*[@clickable='true' or @checkable='true'])[last()]"
     }
+
 
     private fun safeAttr(el: WebElement, name: String): String =
         runCatching { el.getAttribute(name) }.getOrNull()?.trim().orEmpty()

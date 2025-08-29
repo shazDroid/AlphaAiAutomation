@@ -427,123 +427,6 @@ class LocatorResolver(
         return null
     }
 
-
-    fun resolveChangedCheckableByDiff(
-        beforeXml: String?,
-        afterXml: String?,
-        label: String,
-        section: String?
-    ): Locator? {
-        if (beforeXml.isNullOrBlank() || afterXml.isNullOrBlank()) return null
-        val before = org.jsoup.Jsoup.parse(beforeXml, "", org.jsoup.parser.Parser.xmlParser())
-        val after = org.jsoup.Jsoup.parse(afterXml, "", org.jsoup.parser.Parser.xmlParser())
-
-        fun b(s: String): IntArray {
-            val n = Regex("(\\d+)").findAll(s).map { it.value.toInt() }.toList()
-            return if (n.size >= 4) intArrayOf(n[0], n[1], n[2], n[3]) else intArrayOf(0, 0, 0, 0)
-        }
-
-        fun looksToggle(cls: String): Boolean =
-            cls.contains("Switch", true) ||
-                    cls.contains("SwitchCompat", true) ||
-                    cls.contains("MaterialSwitch", true) ||
-                    cls.contains("Toggle", true) ||
-                    cls.contains("Radio", true) ||
-                    cls.contains("CheckBox", true)
-
-        val afterNodes = after.select("node")
-        val labelNodes = afterNodes.filter {
-            val t = it.attr("text")
-            val cd = it.attr("content-desc")
-            t.equals(label, true) || cd.equals(label, true) || t.contains(label, true) || cd.contains(label, true)
-        }
-        if (labelNodes.isEmpty()) return null
-        val ln = labelNodes.minByOrNull { b(it.attr("bounds"))[1] }!!
-        val lb = b(ln.attr("bounds"))
-        val rowY = (lb[1] + lb[3]) / 2
-        val rightEdge = lb[2]
-
-        val beforeMap = before.select("node").associateBy({ it.attr("bounds") }) { it.attr("checked") }
-
-        val changed = afterNodes.filter {
-            val cls = it.attr("class")
-            val checkable = it.attr("checkable") == "true" || it.attr("clickable") == "true" || looksToggle(cls)
-            if (!checkable) return@filter false
-            val bb = b(it.attr("bounds"))
-            val cy = (bb[1] + bb[3]) / 2
-            val cx = (bb[0] + bb[2]) / 2
-            val sameRow = kotlin.math.abs(cy - rowY) <= (lb[3] - lb[1])
-            val toRight = cx > rightEdge
-            if (!(sameRow && toRight)) return@filter false
-            val prev = beforeMap[it.attr("bounds")]
-            val now = it.attr("checked")
-            prev != now && (prev?.isNotEmpty() == true || now.isNotEmpty())
-        }.sortedBy { b(it.attr("bounds"))[0] }
-
-        val pick = changed.lastOrNull() ?: return null
-
-        val rid = pick.attr("resource-id")
-        val desc = pick.attr("content-desc")
-        val txt = pick.attr("text")
-        val xpath = when {
-            rid.isNotBlank() -> "//*[@resource-id=${xpathLiteral(rid)}]"
-            desc.isNotBlank() -> "//*[@content-desc=${xpathLiteral(desc)}]"
-            txt.isNotBlank() -> "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
-            else -> "//*[@bounds='${pick.attr("bounds")}']"
-        }
-        return Locator(Strategy.XPATH, xpath)
-    }
-
-    fun findRightSideClickableForLabel(label: String, section: String?): Locator? {
-        val xml = runCatching { driver.pageSource }.getOrNull() ?: return null
-        val doc = org.jsoup.Jsoup.parse(xml, "", org.jsoup.parser.Parser.xmlParser())
-
-        fun b(s: String): IntArray {
-            val n = Regex("(\\d+)").findAll(s).map { it.value.toInt() }.toList()
-            return if (n.size >= 4) intArrayOf(n[0], n[1], n[2], n[3]) else intArrayOf(0, 0, 0, 0)
-        }
-
-        val nodes = doc.select("node")
-        val labelNodes = nodes.filter {
-            val t = it.attr("text")
-            val cd = it.attr("content-desc")
-            t.equals(label, true) || cd.equals(label, true) || t.contains(label, true) || cd.contains(label, true)
-        }
-        if (labelNodes.isEmpty()) return null
-        val ln = labelNodes.minByOrNull { b(it.attr("bounds"))[1] }!!
-        val lb = b(ln.attr("bounds"))
-        val rowY = (lb[1] + lb[3]) / 2
-        val rightEdge = lb[2]
-
-        val cand = nodes.filter {
-            val clickable = it.attr("clickable") == "true"
-            if (!clickable) return@filter false
-            val cls = it.attr("class")
-            if (!(cls.contains("Switch", true) ||
-                        cls.contains("SwitchCompat", true) ||
-                        cls.contains("MaterialSwitch", true) ||
-                        cls.contains("Toggle", true) ||
-                        cls.contains("Radio", true) ||
-                        cls.contains("CheckBox", true))
-            ) return@filter false
-            val bb = b(it.attr("bounds"))
-            val cy = (bb[1] + bb[3]) / 2
-            val cx = (bb[0] + bb[2]) / 2
-            kotlin.math.abs(cy - rowY) <= (lb[3] - lb[1]) && cx > rightEdge
-        }.maxByOrNull { b(it.attr("bounds"))[0] } ?: return null
-
-        val rid = cand.attr("resource-id")
-        val desc = cand.attr("content-desc")
-        val txt = cand.attr("text")
-        val xpath = when {
-            rid.isNotBlank() -> "//*[@resource-id=${xpathLiteral(rid)}]"
-            desc.isNotBlank() -> "//*[@content-desc=${xpathLiteral(desc)}]"
-            txt.isNotBlank() -> "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
-            else -> "//*[@bounds='${cand.attr("bounds")}']"
-        }
-        return Locator(Strategy.XPATH, xpath)
-    }
-
     fun findSwitchOrCheckableForLabel(label: String, section: String?): Locator? {
         val xml = runCatching { driver.pageSource }.getOrNull() ?: return null
         val doc = org.jsoup.Jsoup.parse(xml, "", org.jsoup.parser.Parser.xmlParser())
@@ -672,9 +555,122 @@ class LocatorResolver(
         return Locator(Strategy.XPATH, xpath)
     }
 
+
+    fun resolveChangedCheckableByDiff(
+        beforeXml: String?,
+        afterXml: String?,
+        label: String,
+        section: String?
+    ): Locator? {
+        if (beforeXml.isNullOrBlank() || afterXml.isNullOrBlank()) return null
+        val before = org.jsoup.Jsoup.parse(beforeXml, "", org.jsoup.parser.Parser.xmlParser())
+        val after = org.jsoup.Jsoup.parse(afterXml, "", org.jsoup.parser.Parser.xmlParser())
+
+        fun b(s: String): IntArray {
+            val n = Regex("(\\d+)").findAll(s).map { it.value.toInt() }.toList()
+            return if (n.size >= 4) intArrayOf(n[0], n[1], n[2], n[3]) else intArrayOf(0, 0, 0, 0)
+        }
+
+        fun looksToggle(cls: String): Boolean =
+            cls.contains("switch", true) ||
+                    cls.contains("switchcompat", true) ||
+                    cls.contains("materialswitch", true) ||
+                    cls.contains("toggle", true) ||
+                    cls.contains("radio", true) ||
+                    cls.contains("checkbox", true)
+
+        val afterNodes = after.select("node")
+        val labelNodes = afterNodes.filter {
+            val t = it.attr("text");
+            val cd = it.attr("content-desc")
+            t.equals(label, true) || cd.equals(label, true) || t.contains(label, true) || cd.contains(label, true)
+        }
+        if (labelNodes.isEmpty()) return null
+        val ln = labelNodes.minByOrNull { b(it.attr("bounds"))[1] }!!
+        val lb = b(ln.attr("bounds"))
+        val rowY = (lb[1] + lb[3]) / 2
+        val rightEdge = lb[2]
+
+        val beforeMap = before.select("node").associateBy({ it.attr("bounds") }) { it.attr("checked") }
+
+        val changed = afterNodes.filter {
+            val cls = it.attr("class")
+            val isToggle = looksToggle(cls) || it.attr("checkable") == "true"
+            if (!isToggle) return@filter false
+            val bb = b(it.attr("bounds"))
+            val cy = (bb[1] + bb[3]) / 2
+            val cx = (bb[0] + bb[2]) / 2
+            val sameRow = kotlin.math.abs(cy - rowY) <= (lb[3] - lb[1])
+            val toRight = cx > rightEdge
+            if (!(sameRow && toRight)) return@filter false
+            val prev = beforeMap[it.attr("bounds")]
+            val now = it.attr("checked")
+            prev != now && (prev?.isNotEmpty() == true || now.isNotEmpty())
+        }.sortedBy { b(it.attr("bounds"))[0] }
+
+        val pick = changed.lastOrNull() ?: return null
+        val rid = pick.attr("resource-id")
+        val desc = pick.attr("content-desc")
+        val txt = pick.attr("text")
+        val xpath = when {
+            rid.isNotBlank() -> "//*[@resource-id=${xpathLiteral(rid)}]"
+            desc.isNotBlank() -> "//*[@content-desc=${xpathLiteral(desc)}]"
+            txt.isNotBlank() -> "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
+            else -> "//*[@bounds='${pick.attr("bounds")}']"
+        }
+        return Locator(Strategy.XPATH, xpath)
+    }
+
+    fun findRightSideClickableForLabel(label: String, section: String?): Locator? {
+        val xml = runCatching { driver.pageSource }.getOrNull() ?: return null
+        val doc = org.jsoup.Jsoup.parse(xml, "", org.jsoup.parser.Parser.xmlParser())
+
+        fun b(s: String): IntArray {
+            val n = Regex("(\\d+)").findAll(s).map { it.value.toInt() }.toList()
+            return if (n.size >= 4) intArrayOf(n[0], n[1], n[2], n[3]) else intArrayOf(0, 0, 0, 0)
+        }
+
+        val nodes = doc.select("node")
+        val labelNodes = nodes.filter {
+            val t = it.attr("text");
+            val cd = it.attr("content-desc")
+            t.equals(label, true) || cd.equals(label, true) || t.contains(label, true) || cd.contains(label, true)
+        }
+        if (labelNodes.isEmpty()) return null
+        val ln = labelNodes.minByOrNull { b(it.attr("bounds"))[1] }!!
+        val lb = b(ln.attr("bounds"))
+        val rowY = (lb[1] + lb[3]) / 2
+        val rightEdge = lb[2]
+
+        val cand = nodes.filter {
+            val cls = it.attr("class")
+            val clickable = it.attr("clickable") == "true"
+            val isToggle = cls.contains("switch", true) || cls.contains("switchcompat", true) ||
+                    cls.contains("materialswitch", true) || cls.contains("toggle", true) ||
+                    cls.contains("radio", true) || cls.contains("checkbox", true)
+            if (!(clickable && isToggle)) return@filter false
+            val bb = b(it.attr("bounds"))
+            val cy = (bb[1] + bb[3]) / 2
+            val cx = (bb[0] + bb[2]) / 2
+            kotlin.math.abs(cy - rowY) <= (lb[3] - lb[1]) && cx > rightEdge
+        }.maxByOrNull { b(it.attr("bounds"))[0] } ?: return null
+
+        val rid = cand.attr("resource-id")
+        val desc = cand.attr("content-desc")
+        val txt = cand.attr("text")
+        val xpath = when {
+            rid.isNotBlank() -> "//*[@resource-id=${xpathLiteral(rid)}]"
+            desc.isNotBlank() -> "//*[@content-desc=${xpathLiteral(desc)}]"
+            txt.isNotBlank() -> "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
+            else -> "//*[@bounds='${cand.attr("bounds")}']"
+        }
+        return Locator(Strategy.XPATH, xpath)
+    }
+
     private fun xpathLiteral(s: String): String = when {
         '\'' !in s -> "'$s'"
         '"' !in s -> "\"$s\""
         else -> "concat('${s.replace("'", "',\"'\",'")}')"
     }
+
 }
