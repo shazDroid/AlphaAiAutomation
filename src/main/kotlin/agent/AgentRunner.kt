@@ -141,6 +141,7 @@ class AgentRunner(
 
                         onLog("✓ input done")
                         handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
+                        agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
                     }
 
                     StepType.TAP -> {
@@ -152,8 +153,117 @@ class AgentRunner(
                         val preferredSection = step.meta["section"] ?: parseSectionFromHint(th)
                         val effectiveSection = preferredSection ?: activeScope
                         val desiredToggle = parseDesiredToggle(th)
+
                         onStatus("Tapping \"$th\"")
                         ensureNotStopped()
+
+                        agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
+                        ensureVisibleByAutoScrollBounded(th, preferredSection, step.index, step.type, 6, onLog)
+
+
+                        fun xpathLiteral(s: String): String = when {
+                            '\'' !in s -> "'$s'"
+                            '"' !in s -> "\"$s\""
+                            else -> "concat('${s.replace("'", "',\"'\",'")}')"
+                        }
+
+                        fun tokens(label: String): List<String> =
+                            label.lowercase()
+                                .replace("&", " ")
+                                .split(Regex("\\s+"))
+                                .filter {
+                                    it.length >= 3 && it !in setOf(
+                                        "to",
+                                        "for",
+                                        "and",
+                                        "the",
+                                        "my",
+                                        "your",
+                                        "a",
+                                        "an",
+                                        "of",
+                                        "on",
+                                        "in",
+                                        "at",
+                                        "with"
+                                    )
+                                }
+
+                        fun buildLocatorForElement(el: org.openqa.selenium.WebElement): String {
+                            fun a(name: String) = runCatching { el.getAttribute(name) }.getOrNull().orEmpty()
+                            val rid = a("resource-id"); if (rid.isNotBlank()) return "//*[@resource-id=${
+                                xpathLiteral(
+                                    rid
+                                )
+                            }]"
+                            val desc =
+                                a("content-desc"); if (desc.isNotBlank()) return "//*[@content-desc=${xpathLiteral(desc)}]"
+                            val txt =
+                                a("text"); if (txt.isNotBlank()) return "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
+                            return "(.//*[@clickable='true'])[1]"
+                        }
+
+                        fun firstClickableByTokens(label: String): Pair<Locator, org.openqa.selenium.WebElement>? {
+                            val toks = tokens(label)
+                            if (toks.isEmpty()) return null
+                            val cond = toks.joinToString(" and ") {
+                                "(contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${
+                                    xpathLiteral(
+                                        it
+                                    )
+                                }) or " +
+                                        "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${
+                                            xpathLiteral(
+                                                it
+                                            )
+                                        }))"
+                            }
+                            val xpClick = "//*[$cond][@clickable='true']"
+                            val clicks =
+                                runCatching { driver.findElements(AppiumBy.xpath(xpClick)) }.getOrNull().orEmpty()
+                            val visibleClick = clicks.firstOrNull { it.isFullyVisible(driver) } ?: clicks.firstOrNull()
+                            if (visibleClick != null) return Locator(
+                                Strategy.XPATH,
+                                buildLocatorForElement(visibleClick)
+                            ) to visibleClick
+
+                            val xpAny = "//*[$cond]"
+                            val any = runCatching { driver.findElements(AppiumBy.xpath(xpAny)) }.getOrNull().orEmpty()
+                            val hit = any.firstOrNull()
+                            if (hit != null) {
+                                val xpAnc = "((//*[@resource-id=${xpathLiteral(hit.getAttribute("resource-id"))} or " +
+                                        "@content-desc=${xpathLiteral(hit.getAttribute("content-desc"))} or " +
+                                        "normalize-space(@text)=${xpathLiteral(hit.getAttribute("text"))}])/ancestor-or-self::*[@clickable='true'])[1]"
+                                val anc =
+                                    runCatching { driver.findElements(AppiumBy.xpath(xpAnc)) }.getOrNull().orEmpty()
+                                        .firstOrNull()
+                                if (anc != null) return Locator(Strategy.XPATH, buildLocatorForElement(anc)) to anc
+                            }
+                            return null
+                        }
+
+                        // REMOVE the old ensureVisibleByScroll() and its call
+
+                        val tokTap = run {
+                            val hit = firstClickableByTokens(th)
+                            if (hit == null) false else {
+                                agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
+                                val before = safePageSourceHash()
+                                runCatching { hit.second.click() }
+                                chosen = hit.first
+                                lastTapY = runCatching { hit.second.rect.let { it.y + it.height / 2 } }.getOrNull()
+                                val dialogHandled = runCatching {
+                                    handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
+                                }.getOrDefault(false)
+                                val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
+                                if (uiChanged) {
+                                    val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                    out += snap; onStep(snap); pc += 1
+                                    true
+                                } else false
+                            }
+                        }
+                        if (tokTap) continue
 
                         if (effectiveSection != null) {
                             val tapped = tapByTextInSection(th, effectiveSection, onLog)
@@ -171,18 +281,14 @@ class AgentRunner(
                                 val before = safePageSourceHash()
                                 val el = runCatching { driver.findElement(AppiumBy.xpath(fast.value)) }.getOrNull()
                                 if (el != null) {
+                                    agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
                                     el.click()
                                     chosen = fast
                                     lastTapY = runCatching { el.rect.let { it.y + it.height / 2 } }.getOrNull()
                                     val vtmp = analyzeWithVisionFast("tap.fast.after", onLog, effectiveSection)
                                     setScope(determineScopeByY(lastTapY, vtmp) ?: activeScope)
                                     val dialogHandled = runCatching {
-                                        handleDialogWithPolling(
-                                            step.index,
-                                            onLog,
-                                            onStatus,
-                                            1600L
-                                        )
+                                        handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
                                     }.getOrDefault(false)
                                     val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
                                     if (uiChanged) {
@@ -208,18 +314,14 @@ class AgentRunner(
                             val vr =
                                 ScreenVision.findToggleForLabel(driver, vres, th, preferredSection) ?: return@run false
                             val before = safePageSourceHash()
+                            agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
                             runCatching { vr.second.click() }
                             chosen = vr.first
 
                             lastTapY = runCatching { vr.second.rect.let { it.y + it.height / 2 } }.getOrNull()
                             setScope(determineScopeByY(lastTapY, vres) ?: activeScope)
                             val dialogHandled = runCatching {
-                                handleDialogWithPolling(
-                                    step.index,
-                                    onLog,
-                                    onStatus,
-                                    1600L
-                                )
+                                handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
                             }.getOrDefault(false)
                             val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
                             if (uiChanged) {
@@ -296,6 +398,7 @@ class AgentRunner(
                                 val validated = preMaterializeValidatedXPath(driver, loc)
                                 val by = validated?.let { AppiumBy.xpath(it.xpath) } ?: AppiumBy.xpath(loc.value)
                                 val el = runCatching { driver.findElement(by) }.getOrNull() ?: return false
+                                agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
                                 el.click()
                                 lastTapY = runCatching { el.rect.let { it.y + it.height / 2 } }.getOrNull()
                                 val vtmp = vres ?: analyzeWithVision("tap.after", onLog)
@@ -338,6 +441,7 @@ class AgentRunner(
                         val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
                         out += snap; onStep(snap); pc += 1; continue
                     }
+
 
 
                     StepType.CHECK -> {
@@ -419,15 +523,41 @@ class AgentRunner(
                     StepType.SCROLL_TO -> {
                         refreshScopeIfHeadersGone(onLog)
                         val th = step.targetHint ?: error("Missing target for SCROLL_TO")
-                        val preferredSection = step.meta["section"] ?: parseSectionFromHint(th)
-                        val effectiveSection = preferredSection ?: activeScope
-                        onStatus("Scrolling to \"$th\"")
-                        ensureNotStopped()
-                        resolver.scrollToText(th)
-                        if (preferredSection != null) resolver.scrollToText(effectiveSection ?: "")
-                        onLog("✓ scrolled")
-                        handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
+
+                        fun findAny(): WebElement? =
+                            runCatching { driver.findElements(AppiumBy.xpath(buildTokenXPathAny(th))) }
+                                .getOrNull().orEmpty().firstOrNull()
+
+                        // If already visible, do not scroll
+                        val first = findAny()
+                        if (first != null && first.isFullyVisible(driver)) {
+                            onLog("auto-scroll skipped — \"$th\" already visible")
+                            handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
+                            // fall through to end-of-step generic capture
+                        } else {
+                            onStatus("Scrolling to \"$th\"")
+                            ensureNotStopped()
+                            agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
+
+                            var swipes = 0
+                            var hit = first
+                            while ((hit == null || !hit.isFullyVisible(driver)) && swipes < 8) {
+                                agent.ui.Gestures.standardScrollUp(driver)
+                                swipes++
+                                resolver.waitForStableUi()
+                                hit = findAny()
+                            }
+
+                            if (swipes > 0) {
+                                onLog("auto-scroll ×$swipes for \"$th\"")
+                                // Silent snapshot (no extra Timeline row)
+                                store.capture(step.index, StepType.SCROLL_TO, th, null, true, "auto=1;count=$swipes")
+                            }
+                            handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
+                        }
                     }
+
+
 
                     StepType.WAIT_OTP -> {
                         val digits = step.value?.toIntOrNull() ?: 6
@@ -502,6 +632,18 @@ class AgentRunner(
                         onStatus("Sliding \"$th\"")
                         withRetry(attempts = 2, delayMs = 500, onError = { n, e -> onLog("  retry($n) SLIDE: ${e.message}") }) {
                             ensureNotStopped()
+
+                            agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
+
+                            ensureVisibleByAutoScrollBounded(
+                                label = th,
+                                section = step.meta["section"] ?: parseSectionFromHint(th),
+                                stepIndex = step.index,
+                                stepType = step.type,
+                                maxSwipes = 6,
+                                onLog = onLog
+                            )
+
                             resolver.waitForStableUi()
                             InputEngine.slideRightByHint(driver, resolver, th) { msg -> onLog("  $msg") }
                         }
@@ -1193,4 +1335,136 @@ class AgentRunner(
         }
         return null
     }
+
+    // Lowercasing tokenized contains() XPATH for label search
+    private fun buildTokenXPath(label: String): String {
+        fun xpathLiteral(s: String): String =
+            if ('\'' !in s) "'$s'" else "concat('${s.replace("'", "',\"'\",'")}')"
+
+        val toks = label.lowercase()
+            .replace("&", " ")
+            .split(Regex("\\s+"))
+            .filter {
+                it.length >= 3 && it !in setOf(
+                    "to",
+                    "for",
+                    "and",
+                    "the",
+                    "my",
+                    "your",
+                    "a",
+                    "an",
+                    "of",
+                    "on",
+                    "in",
+                    "at",
+                    "with"
+                )
+            }
+
+        if (toks.isEmpty()) return "//*" // fallback
+
+        val cond = toks.joinToString(" and ") {
+            "(contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${xpathLiteral(it)}) or " +
+                    " contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${
+                        xpathLiteral(
+                            it
+                        )
+                    }))"
+        }
+        return "//*[$cond]"
+    }
+
+    // Viewport-safe visibility check
+    private fun WebElement.isFullyVisible(driver: org.openqa.selenium.WebDriver): Boolean {
+        val vp = driver.manage().window().size
+        val r = this.rect
+        val topSafe = 40
+        val botSafe = vp.height - 40
+        return r.y >= topSafe && (r.y + r.height) <= botSafe
+    }
+
+    // Convenience re-query
+    private fun findFirstTokenMatch(driver: org.openqa.selenium.WebDriver, label: String)
+            : WebElement? =
+        runCatching {
+            val xp = buildTokenXPath(label)
+            driver.findElements(AppiumBy.xpath(xp)).firstOrNull()
+        }.getOrNull()
+
+    // ==== Auto-scroll gating helpers (DOM + Vision) ====
+
+    private val STOPWORDS = setOf("to","for","and","the","my","your","a","an","of","on","in","at","with")
+
+    private fun tokenList(label: String): List<String> = label.lowercase()
+        .replace("&"," ")
+        .split(Regex("\\s+"))
+        .map { it.trim('\'','"','.',',',':',';','!','?') }
+        .filter { it.length >= 3 && it.any(Char::isLetter) && it !in STOPWORDS }
+
+    // OR-joined token XPath (looser than buildTokenXPath, which AND-joins)
+    private fun buildTokenXPathAny(label: String): String {
+        val toks = tokenList(label)
+        if (toks.isEmpty()) return "//*"
+        val cond = toks.joinToString(" or ") {
+            "(contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${xpathLiteral(it)}) or " +
+                    " contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${xpathLiteral(it)}))"
+        }
+        return "//*[$cond]"
+    }
+
+    private fun findFirstTokenMatchAny(label: String): WebElement? =
+        runCatching { driver.findElements(AppiumBy.xpath(buildTokenXPathAny(label))) }
+            .getOrNull().orEmpty().firstOrNull()
+
+    private fun visionSeesLabelInViewport(label: String, section: String?): Boolean {
+        val v = analyzeWithVisionFast("vis.check", { /* quiet */ }, section) ?: return false
+        val toks = tokenList(label)
+        if (toks.isEmpty()) return false
+        val vp = driver.manage().window().size
+        val topSafe = 40
+        val botSafe = vp.height - 40
+        return v.elements.any { e ->
+            val t = e.text ?: return@any false
+            val y = e.y ?: return@any false
+            val h = e.h ?: return@any false
+            y >= topSafe && (y + h) <= botSafe && toks.any { tok -> t.contains(tok, ignoreCase = true) }
+        }
+    }
+
+    private fun isTargetVisibleNow(label: String, section: String?): Boolean {
+        val domVisible = findFirstTokenMatchAny(label)?.let { it.isFullyVisible(driver) } ?: false
+        return domVisible || visionSeesLabelInViewport(label, section)
+    }
+
+    private fun ensureVisibleByAutoScrollBounded(
+        label: String,
+        section: String?,
+        stepIndex: Int,
+        stepType: StepType,
+        maxSwipes: Int = 6,
+        onLog: (String) -> Unit
+    ): Int {
+        agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
+        resolver.waitForStableUi()
+
+        if (isTargetVisibleNow(label, section)) return 0
+
+        var swipes = 0
+        while (swipes < maxSwipes) {
+            agent.ui.Gestures.standardScrollUp(driver)
+            swipes++
+            resolver.waitForStableUi()
+            if (isTargetVisibleNow(label, section)) break
+        }
+
+        if (swipes > 0) {
+            onLog("auto-scroll ×$swipes before $stepType \"$label\"")
+            // Silent snapshot for script-gen; no extra Timeline row
+            store.capture(stepIndex, StepType.SCROLL_TO, label, null, true, "auto=1;before=$stepType;count=$swipes")
+        }
+        return swipes
+    }
+
+
 }
