@@ -491,4 +491,20 @@ class LocatorResolver(
         return Locator(Strategy.XPATH, xpNth)
     }
 
+    private fun resolveRelativeToAnchor(anchorText: String, targetText: String): By {
+        // normalize text to lower
+        val lowerAnchor = anchorText.lowercase()
+        val lowerTarget = targetText.lowercase()
+
+        // 1. find the anchor node (FROM or TO)
+        val anchorXpath = "//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='$lowerAnchor']"
+
+        // 2. now find the first target below that anchor
+        return AppiumBy.xpath(
+            "($anchorXpath/following::*" +
+                    "[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='$lowerTarget'])[1]"
+        )
+    }
+
+
 }

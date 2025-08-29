@@ -17,6 +17,9 @@ import org.openqa.selenium.JavascriptExecutor
 import org.openqa.selenium.OutputType
 import org.openqa.selenium.WebElement
 import org.openqa.selenium.remote.RemoteWebElement
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 class AgentRunner(
     private val driver: AndroidDriver,
@@ -47,7 +50,6 @@ class AgentRunner(
     private fun tickScopeTtl() {
         if (scopeTtlSteps > 0) scopeTtlSteps--; if (scopeTtlSteps == 0) activeScope = null
     }
-
 
     fun run(
         plan: ActionPlan,
@@ -118,20 +120,7 @@ class AgentRunner(
                     }
 
                     StepType.INPUT_TEXT -> {
-                        runCatching {
-                            val v = analyzeWithVision("scope.check", onLog)
-                            val hasFromTo = v?.elements?.any {
-                                it.text.equals("from", true) || it.text.equals(
-                                    "to",
-                                    true
-                                )
-                            } == true ||
-                                    driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from' or translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']"))
-                                        .isNotEmpty()
-                            if (!hasFromTo) activeScope = null
-                        }.onFailure { /* ignore */ }
-
-
+                        refreshScopeIfHeadersGone(onLog)
                         val th = step.targetHint ?: error("Missing target for INPUT_TEXT")
                         val value = step.value ?: error("Missing value for INPUT_TEXT")
                         onStatus("Typing into \"$th\"")
@@ -147,7 +136,6 @@ class AgentRunner(
                             runCatching { edit.click() }
                             edit.clear()
                             edit.sendKeys(value)
-
                             Locator(Strategy.XPATH, xp)
                         }
 
@@ -156,19 +144,7 @@ class AgentRunner(
                     }
 
                     StepType.TAP -> {
-                        runCatching {
-                            val v = analyzeWithVision("scope.check", onLog)
-                            val hasFromTo = v?.elements?.any {
-                                it.text.equals("from", true) || it.text.equals(
-                                    "to",
-                                    true
-                                )
-                            } == true ||
-                                    driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from' or translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']"))
-                                        .isNotEmpty()
-                            if (!hasFromTo) activeScope = null
-                        }.onFailure { /* ignore */ }
-
+                        refreshScopeIfHeadersGone(onLog)
 
                         val rawHint = step.targetHint ?: error("Missing target for TAP")
                         val th = rawHint.trim()
@@ -179,7 +155,18 @@ class AgentRunner(
                         onStatus("Tapping \"$th\"")
                         ensureNotStopped()
 
-                        // 1) Vision-first
+                        // 0) Section-aware direct text tap (handles duplicates under FROM/TO)
+                        if (effectiveSection != null) {
+                            val tapped = tapByTextInSection(th, effectiveSection, onLog)
+                            if (tapped != null) {
+                                chosen = tapped
+                                handleDialogWithPolling(step.index, onLog, onStatus, 1400L)
+                                val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                out += snap; onStep(snap); pc += 1; continue
+                            }
+                        }
+
+                        // 1) Vision-first (for widgets like toggles)
                         val handledByVision: Boolean = run {
                             var vres = analyzeWithVisionFast("tap.pre", onLog, effectiveSection)
                             val labelFound =
@@ -188,50 +175,47 @@ class AgentRunner(
                                 onLog("vision:tap.pre upgrade_to_ocr")
                                 vres = analyzeWithVisionSlowForText("tap.pre.ocr", onLog, effectiveSection)
                             }
+                            if (vres == null) return@run false
+                            logVisionSummary("tap.pre", vres, preferredSection, onLog)
 
-                            logVisionSummary("tap.pre", vres!!, preferredSection, onLog)
-
-                            val vr = ScreenVision.findToggleForLabel(
-                                driver, vres, th, preferredSection
-                            ) ?: return@run false
-
+                            val vr =
+                                ScreenVision.findToggleForLabel(driver, vres, th, preferredSection) ?: return@run false
                             val before = safePageSourceHash()
                             runCatching { vr.second.click() }
                             chosen = vr.first
 
                             lastTapY = runCatching { vr.second.rect.let { it.y + it.height / 2 } }.getOrNull()
-                            activeScope = determineScopeByY(lastTapY, vres) ?: activeScope
+                            setScope(determineScopeByY(lastTapY, vres) ?: activeScope)
                             onLog("scope:update after tap → ${activeScope ?: "-"}")
 
                             val dialogHandled = runCatching {
-                                handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
+                                handleDialogWithPolling(
+                                    step.index,
+                                    onLog,
+                                    onStatus,
+                                    1600L
+                                )
                             }.getOrDefault(false)
                             val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
                             if (uiChanged) {
                                 onLog("vision:tap.success xpath=${vr.first.value}")
                                 val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                                out += snap
-                                onStep(snap)
-                                pc += 1
-                                true
+                                out += snap; onStep(snap); pc += 1; true
                             } else false
                         }
                         if (handledByVision) continue
 
-                        // 2) Legacy toggle-by-label in UI tree
+                        // 2) Legacy toggle-by-label (DOM)
                         val toggleHit = tryToggleByLabel(th, preferredSection, desiredToggle, onLog)
                         if (toggleHit.first) {
                             chosen = toggleHit.second
                             onLog("✓ toggled (legacy)")
                             handleDialogWithPolling(step.index, onLog, onStatus, 1400L)
                             val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                            out += snap
-                            onStep(snap)
-                            pc += 1
-                            continue
+                            out += snap; onStep(snap); pc += 1; continue
                         }
 
-                        // 3) Candidate search + exact + LLM + semantic
+                        // 3) Candidate search + exact + LLM + semantic (with section scoping)
                         val deadline = System.currentTimeMillis() + timeout
                         var changed = false
                         var tappedLocator: Locator? = null
@@ -249,28 +233,17 @@ class AgentRunner(
                             if (all0.isEmpty()) { Thread.sleep(300); continue }
 
                             val vres = analyzeWithVisionFast("tap.loop", onLog, effectiveSection)
+                            val all = if (effectiveSection != null) applySectionScopeXY(
+                                all0,
+                                effectiveSection,
+                                vres
+                            ) else all0
 
-                            if (vres != null && effectiveSection != null) {
-                                onLog("vision:restrict section=$effectiveSection (before=${all0.size})")
-                            }
-                            val all = if (effectiveSection != null && vres != null)
-                                ScreenVision.restrictCandidatesToSection(
-                                    driver, all0, vres, effectiveSection, getXpath = { it.xpath }
-                                )
-                            else
-                                applySectionScope(all0, effectiveSection)
-
-
-                            fun norm(s: String?) = (s ?: "").lowercase()
-                                .replace("&", "and")
-                                .replace(Regex("[\\p{Punct}]"), " ")
-                                .replace(Regex("\\s+"), " ")
-                                .trim()
-
+                            fun norm(s: String?) = normalize(s)
                             val exact = all.filter { norm(it.label) == norm(th) }.toMutableList()
                             val ordered = mutableListOf<UICandidate>()
                             if (exact.isNotEmpty()) {
-                                ordered += preferByRoleAndPosition(exact)
+                                ordered += preferByRolePosAndHeader(exact, effectiveSection, vres)
                                 onLog("pick:exact ${ordered.first().label}")
                             }
 
@@ -291,16 +264,17 @@ class AgentRunner(
                             }
 
                             if (ordered.isEmpty() && semanticReranker != null) {
-                                val semTop = runCatching { semanticReranker?.rerank(th, all)?.take(10) }
-                                    .getOrDefault(emptyList())
+                                val semTop = runCatching {
+                                    semanticReranker?.rerank(th, all)?.take(10)
+                                }.getOrDefault(emptyList())
                                 if (!semTop.isNullOrEmpty()) ordered += semTop
                             }
 
                             if (ordered.isEmpty()) {
                                 val near = all.filter { nearEquals(th, it.label) }
-                                if (near.isNotEmpty()) ordered += preferByRolePosAndAnchor(near, lastTapY)
+                                if (near.isNotEmpty()) ordered += preferByRolePosAndHeader(near, effectiveSection, vres)
                             }
-                            if (ordered.isEmpty()) ordered += preferByRolePosAndAnchor(all, lastTapY)
+                            if (ordered.isEmpty()) ordered += preferByRolePosAndHeader(all, effectiveSection, vres)
 
                             fun tryTapCandidate(cand: UICandidate): Boolean {
                                 val loc = Locator(Strategy.XPATH, cand.xpath)
@@ -308,12 +282,10 @@ class AgentRunner(
                                 val by = validated?.let { AppiumBy.xpath(it.xpath) } ?: AppiumBy.xpath(loc.value)
                                 val el = runCatching { driver.findElement(by) }.getOrNull() ?: return false
                                 el.click()
-
-                                // after a successful vision tap:
-                                setScope(determineScopeByY(lastTapY, vres) ?: activeScope)
+                                lastTapY = runCatching { el.rect.let { it.y + it.height / 2 } }.getOrNull()
+                                val vtmp = vres ?: analyzeWithVision("tap.after", onLog)
+                                setScope(determineScopeByY(lastTapY, vtmp) ?: activeScope)
                                 onLog("scope:update after tap → ${activeScope ?: "-"}")
-
-
                                 tappedLocator = validated?.toLocatorWith(loc) ?: loc
                                 val dialogHandled = runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }.getOrDefault(false)
                                 val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
@@ -339,24 +311,11 @@ class AgentRunner(
                     }
 
                     StepType.CHECK -> {
-                        runCatching {
-                            val v = analyzeWithVision("scope.check", onLog)
-                            val hasFromTo = v?.elements?.any {
-                                it.text.equals("from", true) || it.text.equals(
-                                    "to",
-                                    true
-                                )
-                            } == true ||
-                                    driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from' or translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']"))
-                                        .isNotEmpty()
-                            if (!hasFromTo) activeScope = null
-                        }.onFailure { /* ignore */ }
-
+                        refreshScopeIfHeadersGone(onLog)
 
                         val th = step.targetHint ?: error("Missing target for CHECK")
                         val preferredSection = step.meta["section"] ?: parseSectionFromHint(th)
                         val effectiveSection = preferredSection ?: activeScope
-
 
                         val desireToken = step.value?.trim()?.lowercase()
                         val desired: Boolean? = when (desireToken) {
@@ -370,10 +329,7 @@ class AgentRunner(
 
                         val pVision = run {
                             val v = analyzeWithVisionFast("check.find", onLog, effectiveSection)
-
-                            if (v == null) null else ScreenVision.findToggleForLabel(
-                                driver, v, th, effectiveSection
-                            )
+                            if (v == null) null else ScreenVision.findToggleForLabel(driver, v, th, effectiveSection)
                         }
 
                         val p = pVision ?: findSwitchOrCheckableForLabel(th, preferredSection)
@@ -404,18 +360,7 @@ class AgentRunner(
                     }
 
                     StepType.WAIT_TEXT -> {
-                        runCatching {
-                            val v = analyzeWithVision("scope.check", onLog)
-                            val hasFromTo = v?.elements?.any {
-                                it.text.equals("from", true) || it.text.equals(
-                                    "to",
-                                    true
-                                )
-                            } == true ||
-                                    driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from' or translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']"))
-                                        .isNotEmpty()
-                            if (!hasFromTo) activeScope = null
-                        }.onFailure { /* ignore */ }
+                        refreshScopeIfHeadersGone(onLog)
 
                         val q = (step.targetHint ?: step.value) ?: error("Missing query for WAIT_TEXT")
                         val timeout = step.meta["timeoutMs"]?.toLongOrNull() ?: DEFAULT_WAIT_TEXT_TIMEOUT_MS
@@ -442,24 +387,10 @@ class AgentRunner(
                     }
 
                     StepType.SCROLL_TO -> {
-                        runCatching {
-                            val v = analyzeWithVision("scope.check", onLog)
-                            val hasFromTo = v?.elements?.any {
-                                it.text.equals("from", true) || it.text.equals(
-                                    "to",
-                                    true
-                                )
-                            } == true ||
-                                    driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from' or translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']"))
-                                        .isNotEmpty()
-                            if (!hasFromTo) activeScope = null
-                        }.onFailure { /* ignore */ }
-
+                        refreshScopeIfHeadersGone(onLog)
                         val th = step.targetHint ?: error("Missing target for SCROLL_TO")
                         val preferredSection = step.meta["section"] ?: parseSectionFromHint(th)
                         val effectiveSection = preferredSection ?: activeScope
-
-
                         onStatus("Scrolling to \"$th\"")
                         ensureNotStopped()
                         resolver.scrollToText(th)
@@ -478,19 +409,7 @@ class AgentRunner(
                     }
 
                     StepType.ASSERT_TEXT -> {
-                        runCatching {
-                            val v = analyzeWithVision("scope.check", onLog)
-                            val hasFromTo = v?.elements?.any {
-                                it.text.equals("from", true) || it.text.equals(
-                                    "to",
-                                    true
-                                )
-                            } == true ||
-                                    driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from' or translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']"))
-                                        .isNotEmpty()
-                            if (!hasFromTo) activeScope = null
-                        }.onFailure { /* ignore */ }
-
+                        refreshScopeIfHeadersGone(onLog)
                         val th = (step.targetHint ?: step.value) ?: error("Missing target for ASSERT_TEXT")
                         onStatus("Asserting \"$th\" is visible")
                         ensureNotStopped()
@@ -567,8 +486,7 @@ class AgentRunner(
             }
 
             val snap = store.capture(step.index, step.type, step.targetHint, chosen, ok, notes)
-            out += snap
-            onStep(snap)
+            out += snap; onStep(snap)
             if (!ok) break
             pc += 1
         }
@@ -720,7 +638,6 @@ class AgentRunner(
         return if (s.equals("null", ignoreCase = true) || s.equals("none", ignoreCase = true)) "" else s
     }
 
-
     private fun ValidatedXPath.toLocatorWith(original: Locator): Locator =
         Locator(strategy = Strategy.XPATH, value = this.xpath, alternatives = listOf(original.strategy to original.value))
 
@@ -734,71 +651,116 @@ class AgentRunner(
         else -> By.xpath(value)
     }
 
-    private fun strictEquals(hint: String, label: String?): Boolean =
-        label?.trim()?.equals(hint.trim(), ignoreCase = true) == true
+    private fun normalize(s: String?): String =
+        (s ?: "")
+            .lowercase()
+            .replace("&", " and ")
+            .replace(Regex("[\\p{Punct}]"), " ")
+            .replace(Regex("(.)\\1{2,}"), "$1$1")
+            .replace(Regex("\\s+"), " ")
+            .trim()
 
-    private fun nearEquals(hint: String, label: String?): Boolean {
-        if (label == null) return false
-        fun norm(s: String): String = s.lowercase().replace("&", " and ").replace(Regex("[\\p{Punct}]"), " ").replace(Regex("\\s+"), " ").trim()
-        return norm(label) == norm(hint)
+    private fun strictEquals(hint: String, label: String?): Boolean =
+        normalize(label) == normalize(hint)
+
+    private fun nearEquals(hint: String, label: String?): Boolean = strictEquals(hint, label)
+
+    // ===== Column/row scoping =====
+
+    private data class Box(val x: Int, val y: Int, val w: Int, val h: Int) {
+        val cx get() = x + w / 2
+        val cy get() = y + h / 2
     }
 
-    private fun preferByRoleAndPosition(list: List<UICandidate>): List<UICandidate> {
-        return list.sortedWith(compareByDescending<UICandidate> {
-            val role = (it.role ?: "").lowercase()
-            when {
-                "button" in role -> 3
-                "tab" in role || "bottom" in role || "nav" in role -> 2
-                else -> 0
+    private fun detectHeaderBoxFromVision(v: VisionResult?, token: String): Box? {
+        if (v == null) return null
+        val e = v.elements.firstOrNull { (it.text ?: "").equals(token, true) } ?: return null
+        return Box(e.x, e.y, e.w, e.h)
+    }
+
+    private fun detectHeaderBoxFromDom(token: String): Box? {
+        val xp = "//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')=${
+            xpathLiteral(token.lowercase())
+        }]"
+        val el = runCatching { driver.findElements(AppiumBy.xpath(xp)).firstOrNull() }.getOrNull() ?: return null
+        val r = el.rect
+        return Box(r.x, r.y, r.width, r.height)
+    }
+
+    private fun getHeaderBoxes(v: VisionResult?): Pair<Box?, Box?> {
+        val fromV = detectHeaderBoxFromVision(v, "from")
+        val toV = detectHeaderBoxFromVision(v, "to")
+        val fromB = fromV ?: detectHeaderBoxFromDom("from")
+        val toB = toV ?: detectHeaderBoxFromDom("to")
+        return fromB to toB
+    }
+
+    private enum class Layout { HORIZONTAL, VERTICAL, UNKNOWN }
+
+    private fun layoutOf(from: Box?, to: Box?): Layout {
+        if (from == null || to == null) return Layout.UNKNOWN
+        val yDelta = abs(from.cy - to.cy)
+        return if (yDelta < 80) Layout.HORIZONTAL else Layout.VERTICAL
+    }
+
+    private fun candidateBox(c: UICandidate): Box? {
+        val rect = runCatching { driver.findElement(AppiumBy.xpath(c.xpath)).rect }.getOrNull() ?: return null
+        return Box(rect.x, rect.y, rect.width, rect.height)
+    }
+
+    private fun applySectionScopeXY(all: List<UICandidate>, preferred: String?, v: VisionResult?): List<UICandidate> {
+        if (preferred == null) return all
+        val (fromB, toB) = getHeaderBoxes(v)
+        val layout = layoutOf(fromB, toB)
+        if (fromB == null && toB == null) return applySectionScope_YOnly(all, preferred)
+
+        val filtered = when (layout) {
+            Layout.HORIZONTAL -> {
+                val splitX = if (fromB != null && toB != null) (fromB.cx + toB.cx) / 2 else (fromB?.cx ?: toB!!.cx)
+                val wantLeft = preferred.equals("from", true)
+                all.filter { c ->
+                    val b = candidateBox(c) ?: return@filter false
+                    val onLeft = b.cx <= splitX
+                    if (fromB != null && toB != null) if (wantLeft) onLeft else !onLeft
+                    else abs(b.cx - (fromB ?: toB!!).cx) < max((fromB ?: toB!!).w, 120)
+                }
             }
-        }.thenByDescending {
-            val rect = runCatching { driver.findElement(AppiumBy.xpath(it.xpath)).rect }.getOrNull()
-            rect?.y ?: 0
+
+            Layout.VERTICAL, Layout.UNKNOWN -> {
+                val tY = fromB?.cy
+                val bY = toB?.cy
+                all.filter { c ->
+                    val b = candidateBox(c) ?: return@filter false
+                    val cy = b.cy
+                    when (preferred.lowercase()) {
+                        "from" -> when {
+                            tY != null && bY != null -> cy in min(tY, bY)..max(tY, bY)    // between FROM & TO
+                            tY != null -> cy >= (tY + 4)                                    // below FROM
+                            bY != null -> cy < (bY - 4)                                     // above TO
+                            else -> true
+                        }
+
+                        "to" -> when {
+                            bY != null -> cy >= (bY + 4)
+                            tY != null -> cy > (tY + 4)
+                            else -> true
+                        }
+
+                        else -> true
+                    }
+                }
+            }
+        }
+
+        val header = if (preferred.equals("from", true)) fromB else toB
+        return if (header == null) filtered
+        else filtered.sortedWith(compareBy<UICandidate> { c ->
+            val b = candidateBox(c) ?: return@compareBy Int.MAX_VALUE
+            abs(b.cy - header.cy) + abs(b.cx - header.cx) / 2
         })
     }
 
-    private fun safePageSourceHash(): Int = runCatching { driver.pageSource.hashCode() }.getOrDefault(0)
-
-    private fun waitUiChangedSince(prevHash: Int, timeoutMs: Long): Boolean {
-        val start = System.currentTimeMillis()
-        while (System.currentTimeMillis() - start < timeoutMs) {
-            val cur = safePageSourceHash()
-            if (cur != prevHash) return true
-            Thread.sleep(120)
-        }
-        return false
-    }
-
-    private inline fun <T> withRetry(attempts: Int, delayMs: Long, onError: (Int, Throwable) -> Unit = { _, _ -> }, block: () -> T): T {
-        var last: Throwable? = null
-        repeat(attempts) { i -> try { return block() } catch (e: Throwable) { last = e; onError(i + 1, e); Thread.sleep(delayMs) } }
-        throw last ?: IllegalStateException("failed")
-    }
-
-    private fun isBusy(): Boolean {
-        val xp = "//*[@indeterminate='true' and self::android.widget.ProgressBar] | //*[contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'progress') and @clickable='false']"
-        return runCatching { driver.findElements(AppiumBy.xpath(xp)).isNotEmpty() }.getOrDefault(false)
-    }
-
-    private fun waitWhileBusy(maxMs: Long): Boolean {
-        val start = System.currentTimeMillis()
-        var sawBusy = false
-        while (System.currentTimeMillis() - start < maxMs) {
-            if (isBusy()) { sawBusy = true; Thread.sleep(200); continue }
-            if (sawBusy) Thread.sleep(150)
-            return sawBusy
-        }
-        return sawBusy
-    }
-
-    private fun parseSectionFromHint(hint: String): String? {
-        val s = hint.lowercase()
-        if (Regex("\\bfor\\s+from\\b|\\bin\\s+from\\b|\\bfrom\\s*:\\s*").containsMatchIn(s)) return "from"
-        if (Regex("\\bfor\\s+to\\b|\\bin\\s+to\\b|\\bto\\s*:\\s*").containsMatchIn(s)) return "to"
-        return null
-    }
-
-    private fun applySectionScope(all: List<UICandidate>, preferred: String?): List<UICandidate> {
+    private fun applySectionScope_YOnly(all: List<UICandidate>, preferred: String?): List<UICandidate> {
         if (preferred == null) return all
         val headers = driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from' or translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']"))
         if (headers.isEmpty()) return all
@@ -809,62 +771,138 @@ class AgentRunner(
             if (t == "from") fromY = it.rect.y
             if (t == "to") toY = it.rect.y
         }
-        fun inFrom(y: Int): Boolean {
+        fun inFrom(cy: Int): Boolean {
             if (fromY == null && toY == null) return true
-            if (fromY != null && toY != null) return y in (kotlin.math.min(
-                fromY!!,
-                toY!!
-            ) - 40)..(kotlin.math.max(fromY!!, toY!!) - 40)
-            if (fromY != null) return y >= fromY!! - 40
-            return y >= toY!! - 40
+            if (fromY != null && toY != null) return cy in (min(fromY!!, toY!!) + 8)..(max(fromY!!, toY!!) - 8)
+            if (fromY != null) return cy >= fromY!! + 8
+            return cy < toY!! - 8
         }
-        fun inTo(y: Int): Boolean = if (toY != null) y >= toY!! - 40 else true
 
-        return all.filter {
+        fun inTo(cy: Int): Boolean = if (toY != null) cy >= toY!! + 8 else (fromY?.let { cy > it + 8 } ?: true)
+
+        val filtered = all.filter {
             val rect = runCatching { driver.findElement(AppiumBy.xpath(it.xpath)).rect }.getOrNull()
             if (rect == null) true else {
+                val cy = rect.y + rect.height / 2
                 when (preferred.lowercase()) {
-                    "from" -> inFrom(rect.y)
-                    "to" -> inTo(rect.y)
+                    "from" -> inFrom(cy)
+                    "to" -> inTo(cy)
                     else -> true
                 }
             }
         }
+
+        val headerCy = when (preferred.lowercase()) {
+            "from" -> fromY
+            "to" -> toY
+            else -> null
+        }
+        return if (headerCy == null) filtered else filtered.sortedBy {
+            val r = runCatching { driver.findElement(AppiumBy.xpath(it.xpath)).rect }.getOrNull()
+            if (r == null) Int.MAX_VALUE else abs((r.y + r.height / 2) - headerCy)
+        }
     }
 
-    private fun findSwitchOrCheckableForLabel(label: String, section: String?): Pair<Locator, WebElement>? {
-        // Vision hint (best effort)
-        val vres = analyzeWithVision("toggle.find", onLog = { })
-        if (vres != null) {
-            val vr = ScreenVision.findToggleForLabel(driver, vres, label, section)
-            if (vr != null) return vr
+    private fun preferByRolePosAndHeader(
+        list: List<UICandidate>,
+        section: String?,
+        v: VisionResult?
+    ): List<UICandidate> {
+        if (list.isEmpty()) return list
+        val (fromB, toB) = getHeaderBoxes(v)
+        val header = when (section?.lowercase()) {
+            "from" -> fromB; "to" -> toB; else -> null
         }
-
-        // Pure DOM by label
-        val lit = xpathLiteral(label.trim())
-        val base = "//*[normalize-space(@text)=$lit]"
-        val scoped = if (section == null) base else {
-            val sec = section.lowercase()
-            val secAnchor = when (sec) {
-                "from" -> "(//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from'])[1]"
-                "to" -> "(//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to'])[1]"
-                else -> ""
+        return list.sortedWith(
+            compareByDescending<UICandidate> {
+                val role = (it.role ?: "").lowercase()
+                when {
+                    "button" in role -> 3
+                    "tab" in role || "bottom" in role || "nav" in role -> 2
+                    else -> 0
+                }
+            }.thenBy { c ->
+                val b = candidateBox(c) ?: return@thenBy Int.MAX_VALUE
+                if (header == null) b.y else abs(b.cy - header.cy) + abs(b.cx - header.cx) / 2
             }
-            if (secAnchor.isNotEmpty()) "($secAnchor/following::${base.removePrefix("//*")})[1]" else base
-        }
+        )
+    }
 
-        val labelEl = driver.findElements(AppiumBy.xpath(scoped)).firstOrNull() ?: return null
-        val container = labelEl.findElements(By.xpath("ancestor::*[self::android.view.ViewGroup or self::android.widget.LinearLayout][1]")).firstOrNull() ?: labelEl
-        val switchOrCheck = container.findElements(AppiumBy.xpath(".//android.widget.Switch | .//*[@checkable='true']")).firstOrNull()
-            ?: run {
-                val rowRight = container.findElements(AppiumBy.xpath(".//*[self::android.widget.Switch or @checkable='true']")).maxByOrNull { it.rect.x + it.rect.width }
-                rowRight
-            }
-        if (switchOrCheck != null) {
-            val xp = buildLocatorForElement(switchOrCheck)
-            return Locator(Strategy.XPATH, xp) to switchOrCheck
-        }
+    // ===== Section-aware direct text tap =====
+
+    private fun tapByTextInSection(label: String, section: String, onLog: (String) -> Unit): Locator? {
+        val candidates = findElementsByTextScoped(label, section)
+        val el = candidates.firstOrNull() ?: return null
+        val clickEl = el.findElements(By.xpath("ancestor::*[@clickable='true'][1]")).firstOrNull() ?: el
+        val before = safePageSourceHash()
+        runCatching { clickEl.click() }.onFailure { return null }
+        lastTapY = runCatching { clickEl.rect.let { it.y + it.height / 2 } }.getOrNull()
+        val vtmp = analyzeWithVision("tap.after", onLog)
+        setScope(determineScopeByY(lastTapY, vtmp) ?: activeScope)
+        onLog("section-tap: clicked '${label}' within $section; scope=${activeScope ?: "-"}")
+        val xp = buildLocatorForElement(clickEl)
+        if (waitUiChangedSince(before, 1500L)) return Locator(Strategy.XPATH, xp)
         return null
+    }
+
+    private fun findElementsByTextScoped(label: String, section: String?): List<WebElement> {
+        val allText = driver.findElements(AppiumBy.xpath("//*[normalize-space(@text)!='']"))
+        val target = normalize(label)
+        val matched = allText.filter {
+            val t = normalize(runCatching { it.text }.getOrNull())
+            t == target
+        }
+        if (matched.isEmpty() || section == null) return matched
+
+        val v = lastVision
+        val (fromB, toB) = getHeaderBoxes(v)
+        val layout = layoutOf(fromB, toB)
+
+        val filtered = when (layout) {
+            Layout.HORIZONTAL -> {
+                val splitX = if (fromB != null && toB != null) (fromB.cx + toB.cx) / 2 else (fromB?.cx ?: toB!!.cx)
+                val wantLeft = section.equals("from", true)
+                matched.filter { el ->
+                    val r = el.rect;
+                    val cx = r.x + r.width / 2
+                    val onLeft = cx <= splitX
+                    if (fromB != null && toB != null) if (wantLeft) onLeft else !onLeft
+                    else abs(cx - (fromB ?: toB!!).cx) < max((fromB ?: toB!!).w, 120)
+                }
+            }
+
+            Layout.VERTICAL, Layout.UNKNOWN -> {
+                val tY = fromB?.cy
+                val bY = toB?.cy
+                matched.filter { el ->
+                    val cy = el.rect.y + el.rect.height / 2
+                    when (section.lowercase()) {
+                        "from" -> when {
+                            tY != null && bY != null -> cy in min(tY, bY)..max(tY, bY)
+                            tY != null -> cy >= (tY + 4)
+                            bY != null -> cy < (bY - 4)
+                            else -> true
+                        }
+
+                        "to" -> when {
+                            bY != null -> cy >= (bY + 4)
+                            tY != null -> cy > (tY + 4)
+                            else -> true
+                        }
+
+                        else -> true
+                    }
+                }
+            }
+        }
+
+        val header = when (section.lowercase()) {
+            "from" -> fromB; "to" -> toB; else -> null
+        }
+        return if (header == null) filtered else filtered.sortedBy { el ->
+            val r = el.rect
+            abs((r.y + r.height / 2) - header.cy) + abs((r.x + r.width / 2) - header.cx) / 2
+        }
     }
 
     private fun buildLocatorForElement(el: WebElement): String {
@@ -909,9 +947,7 @@ class AgentRunner(
         val client = deki ?: run { onLog("vision:$tag disabled"); return null }
         return try {
             onLog("vision:$tag analyze:start")
-            val res = client.analyzePngWithLogs(screenshotPng(), log = { line ->
-                onLog("vision:$tag $line")
-            })
+            val res = client.analyzePngWithLogs(screenshotPng(), log = { line -> onLog("vision:$tag $line") })
             if (res == null) onLog("vision:$tag analyze:null")
             res
         } catch (t: Throwable) {
@@ -919,7 +955,6 @@ class AgentRunner(
             null
         }
     }
-
 
     private fun logVisionSummary(tag: String, v: VisionResult, section: String?, onLog: (String) -> Unit) {
         val topTexts = v.elements
@@ -938,15 +973,13 @@ class AgentRunner(
         fun toYVision(): Int? = v?.elements?.firstOrNull { it.text?.equals("to", true) == true }?.y
 
         val fromY = fromYVision() ?: runCatching {
-            driver.findElements(
-                AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from']")
-            ).firstOrNull()?.rect?.y
+            driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from']"))
+                .firstOrNull()?.rect?.y
         }.getOrNull()
 
         val toY = toYVision() ?: runCatching {
-            driver.findElements(
-                AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']")
-            ).firstOrNull()?.rect?.y
+            driver.findElements(AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']"))
+                .firstOrNull()?.rect?.y
         }.getOrNull()
 
         return when {
@@ -957,81 +990,45 @@ class AgentRunner(
         }
     }
 
-    private fun preferByRolePosAndAnchor(list: List<UICandidate>, anchorY: Int?): List<UICandidate> {
-        return list.sortedWith(
-            compareByDescending<UICandidate> {
-                val role = (it.role ?: "").lowercase()
-                when {
-                    "button" in role -> 3
-                    "tab" in role || "bottom" in role || "nav" in role -> 2
-                    else -> 0
-                }
-            }.thenBy {
-                val y = runCatching { driver.findElement(AppiumBy.xpath(it.xpath)).rect.y }.getOrNull() ?: Int.MAX_VALUE
-                if (anchorY == null) Int.MAX_VALUE else kotlin.math.abs(y - anchorY)
-            }
-        )
+    private fun refreshScopeIfHeadersGone(onLog: (String) -> Unit) {
+        runCatching {
+            val v = analyzeWithVision("scope.check", onLog)
+            val hasFromTo = v?.elements?.any {
+                it.text.equals("from", true) || it.text.equals("to", true)
+            } == true ||
+                    driver.findElements(
+                        AppiumBy.xpath("//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from' or translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to']")
+                    ).isNotEmpty()
+            if (!hasFromTo) activeScope = null else tickScopeTtl()
+        }.onFailure { /* ignore */ }
     }
 
-    private fun cropForScope(png: ByteArray, scope: String?): ByteArray {
-        if (scope == null) return png
-        return runCatching {
-            val img = javax.imageio.ImageIO.read(java.io.ByteArrayInputStream(png))
-            val h = img.height
-            val w = img.width
-            val (y0, y1) = when (scope.lowercase()) {
-                "from" -> 0 to (h * 0.55).toInt()     // top ~55%
-                "to" -> (h * 0.45).toInt() to h     // bottom ~55%
-                else -> 0 to h
-            }
-            val sub = img.getSubimage(0, y0.coerceAtLeast(0), w, (y1 - y0).coerceAtLeast(1))
-            val baos = java.io.ByteArrayOutputStream()
-            javax.imageio.ImageIO.write(sub, "png", baos)
-            baos.toByteArray()
-        }.getOrElse { png }
-    }
+    // ---------- FAST vision paths ----------
 
-    // FAST: small width, small net, no OCR
-    private fun analyzeWithVisionFast(
-        tag: String,
-        onLog: (String) -> Unit,
-        effectiveSection: String?
-    ): VisionResult? {
+    private fun analyzeWithVisionFast(tag: String, onLog: (String) -> Unit, effectiveSection: String?): VisionResult? {
         val client = deki ?: run { onLog("vision:$tag disabled"); return null }
-
-        // cache by pageSource + scope
         val hash = safePageSourceHash()
         if (lastVision != null && lastVisionHash == hash && lastVisionScope == effectiveSection) {
-            onLog("vision:$tag cache:hit")
-            return lastVision
+            onLog("vision:$tag cache:hit"); return lastVision
         }
-
         onLog("vision:$tag analyze:start")
         val shot = screenshotPng()
         val cropped = cropForScope(shot, effectiveSection)
-
         val res = try {
-            // force fast settings here regardless of env
             client.analyzePngWithLogs(
                 png = cropped,
                 log = { line -> onLog("vision:$tag $line") },
-                maxW = 480,        // <— width downscale before sending to Python
-                imgsz = 320,       // <— YOLO input size
+                maxW = 480,
+                imgsz = 320,
                 conf = 0.25f,
-                ocr = false       // <— disable OCR in fast path
+                ocr = false
             )
         } catch (t: Throwable) {
             onLog("vision:$tag error=${t.message}")
             null
         }
-
-        if (res == null) onLog("vision:$tag analyze:null") else {
-            onLog("vision:$tag image=${res.imageW}x${res.imageH} items=${res.elements.size}")
-        }
-        lastVision = res
-        lastVisionHash = hash
-        lastVisionScope = effectiveSection
-        return res
+        if (res == null) onLog("vision:$tag analyze:null") else onLog("vision:$tag image=${res.imageW}x${res.imageH} items=${res.elements.size}")
+        lastVision = res; lastVisionHash = hash; lastVisionScope = effectiveSection; return res
     }
 
     private fun analyzeWithVisionSlowForText(
@@ -1045,7 +1042,125 @@ class AgentRunner(
         return client.analyzePngWithLogs(
             png = cropped,
             log = { line -> onLog("vision:$tag $line") },
-            maxW = 640, imgsz = 416, conf = 0.25f, ocr = true
+            maxW = 640,
+            imgsz = 416,
+            conf = 0.25f,
+            ocr = true
         )
+    }
+
+    private fun cropForScope(png: ByteArray, scope: String?): ByteArray {
+        if (scope == null) return png
+        return runCatching {
+            val img = javax.imageio.ImageIO.read(java.io.ByteArrayInputStream(png))
+            val h = img.height
+            val w = img.width
+            val (y0, y1) = when (scope.lowercase()) {
+                "from" -> 0 to (h * 0.55).toInt()
+                "to" -> (h * 0.45).toInt() to h
+                else -> 0 to h
+            }
+            val sub = img.getSubimage(0, y0.coerceAtLeast(0), w, (y1 - y0).coerceAtLeast(1))
+            val baos = java.io.ByteArrayOutputStream()
+            javax.imageio.ImageIO.write(sub, "png", baos)
+            baos.toByteArray()
+        }.getOrElse { png }
+    }
+
+    // ===== Utility helpers you flagged missing =====
+
+    private fun safePageSourceHash(): Int = runCatching { driver.pageSource.hashCode() }.getOrDefault(0)
+
+    private fun waitUiChangedSince(prevHash: Int, timeoutMs: Long): Boolean {
+        val start = System.currentTimeMillis()
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            val cur = safePageSourceHash()
+            if (cur != prevHash) return true
+            Thread.sleep(120)
+        }
+        return false
+    }
+
+    private inline fun <T> withRetry(
+        attempts: Int,
+        delayMs: Long,
+        onError: (Int, Throwable) -> Unit = { _, _ -> },
+        block: () -> T
+    ): T {
+        var last: Throwable? = null
+        repeat(attempts) { i ->
+            try {
+                return block()
+            } catch (e: Throwable) {
+                last = e; onError(i + 1, e); Thread.sleep(delayMs)
+            }
+        }
+        throw last ?: IllegalStateException("failed")
+    }
+
+    private fun isBusy(): Boolean {
+        val xp =
+            "//*[@indeterminate='true' and self::android.widget.ProgressBar] | //*[contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'progress') and @clickable='false']"
+        return runCatching { driver.findElements(AppiumBy.xpath(xp)).isNotEmpty() }.getOrDefault(false)
+    }
+
+    private fun waitWhileBusy(maxMs: Long): Boolean {
+        val start = System.currentTimeMillis()
+        var sawBusy = false
+        while (System.currentTimeMillis() - start < maxMs) {
+            if (isBusy()) {
+                sawBusy = true; Thread.sleep(200); continue
+            }
+            if (sawBusy) Thread.sleep(150)
+            return sawBusy
+        }
+        return sawBusy
+    }
+
+    private fun parseSectionFromHint(hint: String): String? {
+        val s = hint.lowercase()
+        if (Regex("\\bfor\\s+from\\b|\\bin\\s+from\\b|\\bfrom\\s*:\\s*").containsMatchIn(s)) return "from"
+        if (Regex("\\bfor\\s+to\\b|\\bin\\s+to\\b|\\bto\\s*:\\s*").containsMatchIn(s)) return "to"
+        return null
+    }
+
+    private fun findSwitchOrCheckableForLabel(label: String, section: String?): Pair<Locator, WebElement>? {
+        // Vision hint (best effort)
+        val vres = analyzeWithVision("toggle.find", onLog = { })
+        if (vres != null) {
+            val vr = ScreenVision.findToggleForLabel(driver, vres, label, section)
+            if (vr != null) return vr
+        }
+
+        // Pure DOM by label, optionally scoped to section by relative position to FROM/TO
+        val lit = xpathLiteral(label.trim())
+        val base = "//*[normalize-space(@text)=$lit]"
+        val scoped = if (section == null) base else {
+            val sec = section.lowercase()
+            val secAnchor = when (sec) {
+                "from" -> "(//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='from'])[1]"
+                "to" -> "(//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='to'])[1]"
+                else -> ""
+            }
+            if (secAnchor.isNotEmpty()) "($secAnchor/following::${base.removePrefix("//*")})[1]" else base
+        }
+
+        val labelEl = driver.findElements(AppiumBy.xpath(scoped)).firstOrNull() ?: return null
+        val container =
+            labelEl.findElements(By.xpath("ancestor::*[self::android.view.ViewGroup or self::android.widget.LinearLayout][1]"))
+                .firstOrNull() ?: labelEl
+        val switchOrCheck =
+            container.findElements(AppiumBy.xpath(".//android.widget.Switch | .//*[@checkable='true']")).firstOrNull()
+                ?: run {
+                    val rowRight =
+                        container.findElements(AppiumBy.xpath(".//*[self::android.widget.Switch or @checkable='true']"))
+                            .maxByOrNull { it.rect.x + it.rect.width }
+                    rowRight
+                }
+        if (switchOrCheck != null) {
+            val xp = buildLocatorForElement(switchOrCheck)
+            return Locator(Strategy.XPATH, xp) to switchOrCheck
+        }
+        return null
     }
 }

@@ -997,22 +997,22 @@ fun AgentComponent(
 
                             val resolver = LocatorResolver(driver, onLog)
                             val store = SnapshotStore(driver, File("runs/${System.currentTimeMillis()}"))
-                            val dekiClient = DekiYoloClient(
-                                python = "C:\\Python312\\python.exe",
-                                scriptPath = "D:\\Alpha UI Automation\\BackEnd\\deki_cli.py"
-                            )
+                            val dekiClient = DekiYoloClient()
 
                             val gemini = GeminiDisambiguator(
                                 apiKey = System.getenv("GEMINI_API_KEY") ?: "AIzaSyBAB1n3XuO7Ra1wfrZNXPTWJRigDNvPtbE",
                                 model = System.getenv("GEMINI_MODEL") ?: "gemini-2.5-flash-lite"
                             )
 
+                            val embedder = agent.semantic.GeminiEmbedder("AIzaSyBAB1n3XuO7Ra1wfrZNXPTWJRigDNvPtbE")
+                            val reranker = agent.semantic.SemanticReranker(embedder)
+
                             val result = AgentRunner(
                                 driver = driver,
                                 resolver = resolver,
                                 store = store,
                                 llmDisambiguator = gemini,
-                                semanticReranker = semanticReranker,
+                                semanticReranker = reranker,
                                 deki = dekiClient
                             ).run(
                                 plan = p,
