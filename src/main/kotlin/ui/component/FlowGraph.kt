@@ -142,30 +142,56 @@ fun NodeGraphEditor(
     onNodePositionChange: (nodeId: String, dragAmount: Offset) -> Unit,
     onNewConnection: (Connection) -> Unit,
     modifier: Modifier = Modifier,
-    onAutoArrange: (() -> Unit)? = null   // <— optional; doesn’t break existing call sites
+    onAutoArrange: (() -> Unit)? = null,
+    graphKey: Any? = null                      // <— tell the editor when the graph “changes”
 ) {
-    // Camera
-    var canvasOffset by remember { mutableStateOf(Offset.Zero) }
-    var scale by remember { mutableStateOf(1f) }
+    // ——— camera & transient state (reset per graphKey) ———
+    var canvasOffset by remember(graphKey) { mutableStateOf(Offset.Zero) }
+    var scale by remember(graphKey) { mutableStateOf(1f) }
+    var connectionDragState by remember(graphKey) { mutableStateOf<ConnectionDragState?>(null) }
+    val portPositions = remember(graphKey) { mutableStateMapOf<String, Offset>() }
+    var isDraggingNode by remember(graphKey) { mutableStateOf(false) }
 
-    // Wire drag
-    var connectionDragState by remember { mutableStateOf<ConnectionDragState?>(null) }
-
-    // Port centers in editor-local coordinates (so the wire canvas doesn’t need transforms)
-    val portPositions = remember { mutableStateMapOf<String, Offset>() }
-    val allPorts = remember(nodes) { nodes.flatMap { it.inputs + it.outputs } }
-
-    // Editor origin in root; used to convert port centers to editor-local
+    // editor geometry
     var editorOrigin by remember { mutableStateOf(Offset.Zero) }
+    var editorSize by remember { mutableStateOf(androidx.compose.ui.unit.IntSize.Zero) }
     val density = LocalDensity.current
+
+    // helper: compute a nice camera that fits all nodes in view
+    fun zoomToFit(paddingPx: Float = 80f) {
+        if (nodes.isEmpty() || editorSize.width == 0 || editorSize.height == 0) return
+        val minX = nodes.minOf { it.position.x }
+        val maxX = nodes.maxOf { it.position.x + 240f } // ~ node width in world units
+        val minY = nodes.minOf { it.position.y }
+        val maxY = nodes.maxOf { it.position.y + 120f } // ~ node height
+
+        val worldW = (maxX - minX).coerceAtLeast(1f)
+        val worldH = (maxY - minY).coerceAtLeast(1f)
+        val viewW = editorSize.width.toFloat() - paddingPx * 2
+        val viewH = editorSize.height.toFloat() - paddingPx * 2
+
+        val s = minOf(viewW / worldW, viewH / worldH)
+            .coerceIn(0.2f, 3f)
+        scale = if (s.isFinite() && s > 0f) s else 1f
+
+        val centerWorld = Offset(minX + worldW / 2f, minY + worldH / 2f)
+        val centerView = Offset(editorSize.width / 2f, editorSize.height / 2f)
+        canvasOffset = centerView - centerWorld * scale
+    }
+
+    // auto-fit whenever a new graph is selected or size changes
+    LaunchedEffect(graphKey, editorSize) { zoomToFit() }
 
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(Color(0xFFF8F9FA))
-            .onGloballyPositioned { editorOrigin = it.positionInRoot() }
-            .pointerInput(Unit) {
-                // Zoom via scroll (grid stays screen-space; see next Canvas)
+            .onGloballyPositioned {
+                editorOrigin = it.positionInRoot()
+                editorSize = it.size
+            }
+            // zoom with wheel
+            .pointerInput(graphKey, scale) {
                 awaitPointerEventScope {
                     while (true) {
                         val event = awaitPointerEvent()
@@ -181,18 +207,21 @@ fun NodeGraphEditor(
                     }
                 }
             }
-            .pointerInput(Unit) {
+            // pan with drag (but not while dragging a node)
+            .pointerInput(graphKey, isDraggingNode) {
                 detectDragGestures { change, drag ->
-                    change.consume()
-                    canvasOffset += drag
+                    if (!isDraggingNode) {
+                        change.consume()
+                        canvasOffset += drag
+                    }
                 }
             }
     ) {
-        // Screen-space dotted grid (grows with zoom, fills viewport)
+        // dotted grid (screen-space)
         Canvas(Modifier.fillMaxSize()) {
             val base = 20.dp.toPx()
             val step = (base * scale).coerceAtLeast(8f)
-            fun posMod(a: Float, b: Float): Float = ((a % b) + b) % b
+            fun posMod(a: Float, b: Float) = ((a % b) + b) % b
             val startX = posMod(-canvasOffset.x, step)
             val startY = posMod(-canvasOffset.y, step)
             var x = startX
@@ -206,7 +235,7 @@ fun NodeGraphEditor(
             }
         }
 
-        // Wires
+        // wires
         Canvas(Modifier.fillMaxSize()) {
             connections.forEach { c ->
                 val s = portPositions["${c.fromNodeId}_${c.fromPortId}"]
@@ -219,12 +248,14 @@ fun NodeGraphEditor(
             }
         }
 
-        // Nodes
+        // nodes
         nodes.forEach { node ->
             GraphNode(
                 node = node,
                 offset = node.position * scale + canvasOffset,
                 scale = scale,
+                onDragStart = { isDraggingNode = true },
+                onDragEnd = { isDraggingNode = false },
                 onPositionChange = { drag -> onNodePositionChange(node.id, drag / scale) },
                 onPortPositioned = { port, posInRoot ->
                     portPositions["${port.nodeId}_${port.id}"] = posInRoot - editorOrigin
@@ -240,7 +271,7 @@ fun NodeGraphEditor(
                 },
                 onConnectionDragEnd = {
                     connectionDragState?.let { st ->
-                        val endPort = allPorts.find { port ->
+                        val endPort = (nodes.flatMap { it.inputs + it.outputs }).find { port ->
                             portPositions["${port.nodeId}_${port.id}"]?.let { p ->
                                 (st.currentPosition - p).getDistance() < 20.dp.toPx(density)
                             } == true
@@ -255,15 +286,13 @@ fun NodeGraphEditor(
                         }
                     }
                     connectionDragState = null
-                }
+                },
+                graphKey = graphKey
             )
         }
 
-        // Zoom + optional Auto button (keeps API backwards compatible)
-        Column(
-            modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
+        // zoom controls + auto
+        Column(Modifier.align(Alignment.BottomEnd).padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = { scale = (scale * 1.2f).coerceIn(0.2f, 3f) }) {
                 Icon(Icons.Default.KeyboardArrowUp, contentDescription = "Zoom In")
             }
@@ -271,7 +300,7 @@ fun NodeGraphEditor(
                 Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Zoom Out")
             }
             if (onAutoArrange != null) {
-                Button(onClick = onAutoArrange) { Text("Auto") }
+                Button(onClick = { onAutoArrange(); zoomToFit() }) { Text("Auto") }  // fit after arrange
             }
         }
     }
@@ -286,11 +315,14 @@ private fun GraphNode(
     node: Node,
     offset: Offset,
     scale: Float,
+    onDragStart: () -> Unit,
+    onDragEnd: () -> Unit,
     onPositionChange: (Offset) -> Unit,
     onPortPositioned: (Port, Offset) -> Unit,
     onConnectionDragStart: (Port) -> Unit,
     onConnectionDrag: (Offset) -> Unit,
-    onConnectionDragEnd: () -> Unit
+    onConnectionDragEnd: () -> Unit,
+    graphKey: Any? = null
 ) {
     Box(
         modifier = Modifier
@@ -298,8 +330,12 @@ private fun GraphNode(
             .width((240 * scale).dp)
             .shadow((8 * scale).dp, RoundedCornerShape((12 * scale).dp))
             .background(Color.White, RoundedCornerShape((12 * scale).dp))
-            .pointerInput(node.id) {
-                detectDragGestures { change, drag ->
+            .pointerInput(graphKey, node.id) {
+                detectDragGestures(
+                    onDragStart = { onDragStart() },
+                    onDragEnd = { onDragEnd() },
+                    onDragCancel = { onDragEnd() }
+                ) { change, drag ->
                     change.consume()
                     onPositionChange(drag)
                 }
@@ -334,7 +370,8 @@ private fun GraphNode(
                             onPortPositioned,
                             onConnectionDragStart,
                             onConnectionDrag,
-                            onConnectionDragEnd
+                            onConnectionDragEnd,
+                            graphKey
                         )
                     }
                 }
@@ -360,7 +397,8 @@ private fun GraphNode(
                             onPortPositioned,
                             onConnectionDragStart,
                             onConnectionDrag,
-                            onConnectionDragEnd
+                            onConnectionDragEnd,
+                            graphKey
                         )
                     }
                 }
@@ -376,7 +414,8 @@ private fun PortHandle(
     onPositioned: (Port, Offset) -> Unit,
     onDragStart: (Port) -> Unit,
     onDrag: (Offset) -> Unit,
-    onDragEnd: () -> Unit
+    onDragEnd: () -> Unit,
+    graphKey: Any? = null
 ) {
     Box(
         modifier = Modifier
@@ -386,7 +425,7 @@ private fun PortHandle(
                 val center = Offset(p.x + lc.size.width / 2, p.y + lc.size.height / 2)
                 onPositioned(port, center) // report in root; editor converts to local
             }
-            .pointerInput(port.id) {
+            .pointerInput(graphKey, port.id) {
                 detectDragGestures(
                     onDragStart = { onDragStart(port) },
                     onDragEnd = { onDragEnd() }

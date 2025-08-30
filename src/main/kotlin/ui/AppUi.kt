@@ -13,6 +13,11 @@ import agent.llm.GeminiDisambiguator
 import agent.llm.LlmDisambiguator
 import agent.memory.ComponentMemory
 import agent.memory.ComponentMemoryAdapter
+import agent.memory.MemActivity
+import agent.memory.MemApp
+import agent.memory.MemEntry
+import agent.memory.MemIndex
+import agent.memory.MemSelector
 import agent.vision.DekiYoloClient
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.desktop.ui.tooling.preview.Preview
@@ -77,18 +82,6 @@ private val LOG_TIME_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("hh:mm
 // ----------------------- Memory browser model + loader -----------------------
 
 // --- keep your data classes as-is ---
-private data class MemSelector(val strategy: String, val value: String, val ok: Int, val fail: Int, val last: Long)
-private data class MemEntry(
-    val appPkg: String,
-    val activity: String,
-    val op: String,
-    val hint: String,
-    val file: File,
-    val selectors: List<MemSelector>
-)
-private data class MemActivity(val name: String, val entries: List<MemEntry>)
-private data class MemApp(val name: String, val activities: List<MemActivity>)
-private data class MemIndex(val apps: List<MemApp>, val totalEntries: Int, val totalSelectors: Int)
 
 private fun flattenMemIndex(index: MemIndex): List<MemEntry> =
     index.apps.flatMap { app ->
@@ -850,7 +843,6 @@ private fun MemoryBrowserView(
                 Spacer(Modifier.height(8.dp))
 
                 if (tab == 0) {
-                    // --- existing hierarchical view (unchanged) ---
                     val scroll = rememberScrollState()
                     Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
                         if (index.apps.isEmpty()) {
@@ -889,24 +881,21 @@ private fun MemoryBrowserView(
                         }
                     }
                 } else {
-                    // --- flat "All memories" list (your MemoryBrowser condensed) ---
                     LazyColumn(Modifier.fillMaxSize()) {
-                        items(flatItems.size) { i ->
-                            val e = flatItems[i]
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .clickable { onSelect(e) }
-                                    .padding(vertical = 6.dp),
-                                horizontalArrangement = Arrangement.spacedBy(12.dp)
-                            ) {
-                                Text(e.appPkg, Modifier.width(220.dp))
-                                Text(e.activity.substringAfterLast('.'), Modifier.width(180.dp))
-                                Text(e.op, Modifier.width(100.dp))
-                                Text(e.hint, Modifier.weight(1f))
-                                Text("${e.selectors.size} sel", Modifier.width(72.dp))
-                            }
-                            Divider()
+                        items(
+                            items = flatItems,
+                            key = { e -> "${e.appPkg}|${e.activity}|${e.op}|${e.hint}" }
+                        ) { e ->
+                            MemoryEntryCard(
+                                e = e,
+                                selected = selected?.let { s ->
+                                    s.appPkg == e.appPkg &&
+                                            s.activity == e.activity &&
+                                            s.op == e.op &&
+                                            s.hint == e.hint
+                                } ?: false,
+                                onSelect = onSelect
+                            )
                         }
                     }
                 }
@@ -1000,6 +989,8 @@ private fun MemoryBrowserView(
                     mutableStateListOf<Connection>().also { it.addAll(autoConnect(nodes)) }
                 }
 
+                val keyForGraph = selected?.let { "${it.appPkg}|${it.activity}|${it.op}|${it.hint}" } ?: "empty"
+
                 LaunchedEffect(selected) {
                     autoArrangeNodes(
                         nodes, connections,
@@ -1016,9 +1007,14 @@ private fun MemoryBrowserView(
                 NodeGraphEditor(
                     nodes = nodes,
                     connections = connections,
-                    onNodePositionChange = { nodeId, drag ->
-                        val i = nodes.indexOfFirst { it.id == nodeId }
-                        if (i != -1) nodes[i] = nodes[i].copy(position = nodes[i].position + drag)
+                    onNodePositionChange = { id, drag ->
+                        val i = nodes.indexOfFirst { it.id == id }
+                        if (i != -1) {
+                            val p = nodes[i].position + drag
+                            nodes[i] = nodes[i].copy(
+                                position = Offset(p.x.coerceAtLeast(-100f), p.y.coerceAtLeast(-100f))
+                            )
+                        }
                     },
                     onNewConnection = { newConn ->
                         if (connections.none {
@@ -1039,7 +1035,8 @@ private fun MemoryBrowserView(
                             rowGap = 240f,
                             diagStep = 150f
                         )
-                    }
+                    },
+                    graphKey = keyForGraph
                 )
             }
         }
