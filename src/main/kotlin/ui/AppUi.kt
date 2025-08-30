@@ -11,6 +11,8 @@ import agent.Snapshot
 import agent.SnapshotStore
 import agent.llm.GeminiDisambiguator
 import agent.llm.LlmDisambiguator
+import agent.memory.ComponentMemory
+import agent.memory.ComponentMemoryAdapter
 import agent.vision.DekiYoloClient
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.desktop.ui.tooling.preview.Preview
@@ -74,6 +76,7 @@ private val LOG_TIME_FMT: DateTimeFormatter = DateTimeFormatter.ofPattern("hh:mm
 
 // ----------------------- Memory browser model + loader -----------------------
 
+// --- keep your data classes as-is ---
 private data class MemSelector(val strategy: String, val value: String, val ok: Int, val fail: Int, val last: Long)
 private data class MemEntry(
     val appPkg: String,
@@ -83,24 +86,103 @@ private data class MemEntry(
     val file: File,
     val selectors: List<MemSelector>
 )
-
 private data class MemActivity(val name: String, val entries: List<MemEntry>)
 private data class MemApp(val name: String, val activities: List<MemActivity>)
 private data class MemIndex(val apps: List<MemApp>, val totalEntries: Int, val totalSelectors: Int)
 
+private fun flattenMemIndex(index: MemIndex): List<MemEntry> =
+    index.apps.flatMap { app ->
+        app.activities.flatMap { act ->
+            act.entries.map {
+                it.copy(
+                    appPkg = app.name,
+                    activity = act.name
+                )
+            }
+        }
+    }
+        .sortedWith(compareBy({ it.appPkg }, { it.activity }, { it.op }, { it.hint.lowercase() }))
+
 private fun loadSelectorMemoryIndex(root: File = File("memory")): MemIndex {
-    if (!root.exists()) return MemIndex(emptyList(), 0, 0)
-    val apps = mutableListOf<MemApp>()
+    val absRoot = root.absoluteFile
+    println("mem: root=${absRoot} exists=${absRoot.exists()} isDir=${absRoot.isDirectory}")
+
+    val appsByPkg = linkedMapOf<String, MutableMap<String, MutableList<MemEntry>>>() // pkg -> (activity -> entries)
     var entryCount = 0
     var selectorCount = 0
 
-    root.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }?.forEach { appDir ->
-        val acts = mutableListOf<MemActivity>()
+    fun mergeEntry(e: MemEntry) {
+        val acts = appsByPkg.getOrPut(e.appPkg) { linkedMapOf() }
+        val list = acts.getOrPut(e.activity) { mutableListOf() }
+        val existing = list.firstOrNull { it.op == e.op && it.hint == e.hint }
+        if (existing == null) {
+            list += e
+            entryCount++
+            selectorCount += e.selectors.size
+        } else {
+            val merged = (existing.selectors + e.selectors)
+                .groupBy { it.strategy to it.value }
+                .map { (_, ss) ->
+                    val ok = ss.sumOf { s -> s.ok }
+                    val fail = ss.sumOf { s -> s.fail }
+                    val last = ss.maxOfOrNull { s -> s.last } ?: 0L
+                    MemSelector(ss.first().strategy, ss.first().value, ok, fail, last)
+                }
+            val idx = list.indexOf(existing)
+            list[idx] = existing.copy(selectors = merged)
+            selectorCount += (merged.size - existing.selectors.size).coerceAtLeast(0)
+        }
+    }
+
+    // ---------- JSON: components.json (preferred) + component.json (legacy) ----------
+    val jsonCandidates = listOf("components.json", "component.json")
+        .map { File(absRoot, it) }
+        .filter { it.isFile }
+
+    if (jsonCandidates.isNotEmpty()) {
+        val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+            .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+            .registerKotlinModule()
+
+        jsonCandidates.forEach { jf ->
+            println("mem: reading ${jf.absolutePath} size=${jf.length()} bytes")
+            runCatching {
+                val rootNode = mapper.readTree(jf)
+                val fields = rootNode.fields()
+                var count = 0
+                while (fields.hasNext()) {
+                    val (key, node) = fields.next()
+                    val pkg = node.get("pkg")?.asText().orEmpty()
+                    val act = node.get("activity")?.asText().orEmpty()
+                    val op = node.get("op")?.asText().orEmpty()
+                    val hint = node.get("hint")?.asText().orEmpty()
+                    val sels = node.get("selectors")?.mapNotNull { s ->
+                        val strat = s.get("strategy")?.asText() ?: return@mapNotNull null
+                        val valStr = s.get("value")?.asText() ?: return@mapNotNull null
+                        val ok = s.get("successes")?.asInt() ?: 0
+                        val fail = s.get("failures")?.asInt() ?: 0
+                        val last = s.get("lastSeen")?.asLong() ?: 0L
+                        MemSelector(strat, valStr, ok, fail, last)
+                    } ?: emptyList()
+                    mergeEntry(MemEntry(pkg, act, op, hint, jf, sels))
+                    count++
+                }
+                println("mem: loaded ${count} entries from ${jf.name}")
+            }.onFailure { e ->
+                println("mem: ERROR reading ${jf.absolutePath}: ${e.message}")
+            }
+        }
+    } else {
+        println("mem: no components.json/component.json in ${absRoot}")
+    }
+
+    // ---------- LEGACY TSV fallback (memory/<pkg>/<act>/*.tsv) ----------
+    absRoot.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }?.forEach { appDir ->
         appDir.listFiles()?.filter { it.isDirectory }?.sortedBy { it.name }?.forEach { actDir ->
-            val entries = mutableListOf<MemEntry>()
-            actDir.listFiles()?.filter { it.isFile && it.extension.lowercase() == "tsv" }?.sortedBy { it.name }
+            actDir.listFiles()
+                ?.filter { it.isFile && it.extension.equals("tsv", true) }
+                ?.sortedBy { it.name }
                 ?.forEach { file ->
-                    // filename pattern from SimpleSelectorMemory: <op>_<hintSafe>.tsv
                     val raw = file.nameWithoutExtension
                     val us = raw.indexOf('_')
                     val op = if (us > 0) raw.substring(0, us) else raw
@@ -109,24 +191,31 @@ private fun loadSelectorMemoryIndex(root: File = File("memory")): MemIndex {
                         file.readLines().mapNotNull { line ->
                             val p = line.split('\t')
                             if (p.size < 5) null else MemSelector(
-                                strategy = p[0],
-                                value = p[1],
+                                strategy = p[0], value = p[1],
                                 ok = p[2].toIntOrNull() ?: 0,
                                 fail = p[3].toIntOrNull() ?: 0,
                                 last = p[4].toLongOrNull() ?: 0L
                             )
                         }
                     }.getOrElse { emptyList() }
-                    entries += MemEntry(appDir.name, actDir.name, op, hint, file, sels)
-                    entryCount++
-                    selectorCount += sels.size
+                    mergeEntry(MemEntry(appDir.name, actDir.name, op, hint, file, sels))
                 }
-            if (entries.isNotEmpty()) acts += MemActivity(actDir.name, entries)
         }
-        if (acts.isNotEmpty()) apps += MemApp(appDir.name, acts)
     }
+
+    // ---------- Build final tree ----------
+    val apps = appsByPkg.map { (pkg, actsMap) ->
+        val activities = actsMap.map { (act, entries) ->
+            val sorted = entries.sortedWith(compareBy({ it.op }, { it.hint.lowercase() }))
+            MemActivity(act, sorted)
+        }.sortedBy { it.name }
+        MemApp(pkg, activities)
+    }.sortedBy { it.name }
+
+    println("mem: result apps=${apps.size} entries=$entryCount selectors=$selectorCount")
     return MemIndex(apps, entryCount, selectorCount)
 }
+
 
 // ----------------------- Graph builder for memory entry -----------------------
 
@@ -263,7 +352,7 @@ fun AppUI() {
 
     // NEW — Memory browser state
     var showMemoryView by remember { mutableStateOf(false) }
-    var memIndex by remember { mutableStateOf(loadSelectorMemoryIndex()) }
+    var memIndex by remember { mutableStateOf(loadSelectorMemoryIndex(File("memory"))) }
     var selectedEntry by remember { mutableStateOf<MemEntry?>(null) }
 
     // live screen
@@ -365,6 +454,8 @@ fun AppUI() {
 
                 Spacer(Modifier.height(16.dp))
 
+                val memRoot = remember { File("memory").absoluteFile }
+
                 // ---------------- Memory Browser Card ----------------
                 SectionTitle("Store Memory")
                 Spacer(Modifier.height(8.dp))
@@ -376,19 +467,19 @@ fun AppUI() {
                                 showAgentView = false
                                 showAnimation = false
                             }
-                            Spacer(Modifier.width(8.dp))
+                        }
+
+                        Spacer(Modifier.width(8.dp))
+
+                        Row {
                             AlphaButton(text = "Reload") {
-                                memIndex = loadSelectorMemoryIndex()
-                                // if reloading emptied selection, clear the graph
+                                memIndex = loadSelectorMemoryIndex(File("memory"))
                                 if (selectedEntry != null &&
-                                    memIndex.apps.none { app ->
-                                        app.activities.any { act ->
-                                            act.entries.any { it.file == selectedEntry!!.file }
-                                        }
-                                    }
+                                    memIndex.apps.none { app -> app.activities.any { act -> act.entries.any { it.file == selectedEntry!!.file } } }
                                 ) selectedEntry = null
                             }
                         }
+
                         Spacer(Modifier.height(8.dp))
                         Text(
                             "Entries: ${memIndex.totalEntries} • Selectors: ${memIndex.totalSelectors}",
@@ -740,6 +831,7 @@ private fun MemoryBrowserView(
     selected: MemEntry?,
     onSelect: (MemEntry) -> Unit
 ) {
+    val memoryTabList = listOf("Tree", "All")
     Text("Store Memory", fontWeight = MaterialTheme.typography.h6.fontWeight)
     Spacer(Modifier.height(8.dp))
 
@@ -747,39 +839,80 @@ private fun MemoryBrowserView(
 
         // Left: hierarchical list (apps -> activities -> entries)
         RightCard(modifier = Modifier.weight(0.24f).height(680.dp), pad = 10.dp) {
-            val scroll = rememberScrollState()
-            Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
-                if (index.apps.isEmpty()) {
-                    Text("No memory yet. Run the agent to learn selectors.", color = Color.Gray)
-                } else {
-                    index.apps.forEach { app ->
-                        Text("📱 ${app.name}", fontWeight = MaterialTheme.typography.h6.fontWeight)
-                        Spacer(Modifier.height(6.dp))
-                        app.activities.forEach { act ->
-                            Text("  • ${act.name}", color = Color(0xFF444444))
-                            Spacer(Modifier.height(6.dp))
-                            act.entries.forEach { e ->
-                                val title = "     — ${e.op} → ${e.hint}   [${e.selectors.size} selectors]"
-                                Row(
-                                    modifier = Modifier.fillMaxWidth()
-                                        .padding(vertical = 4.dp)
-                                        .background(
-                                            if (selected?.file == e.file) Color(0xFFE8F0FF) else Color.Transparent,
-                                            RoundedCornerShape(6.dp)
-                                        )
-                                        .clickable { onSelect(e) }
-                                        .padding(6.dp)
-                                ) {
-                                    Text(title, color = Color(0xFF555555), fontSize = TextUnit(12f, TextUnitType.Sp))
+            var tab by remember { mutableStateOf(0) } // 0 = Tree, 1 = All
+            val flatItems = remember(index) { flattenMemIndex(index) }
+
+            Column(Modifier.fillMaxSize()) {
+                // Tabs
+                AlphaTabRow(selectedTabIndex = tab, tabs = memoryTabList, onTabSelected = {
+                    tab = it
+                })
+                Spacer(Modifier.height(8.dp))
+
+                if (tab == 0) {
+                    // --- existing hierarchical view (unchanged) ---
+                    val scroll = rememberScrollState()
+                    Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
+                        if (index.apps.isEmpty()) {
+                            Text("No memory yet. Run the agent to learn selectors.", color = Color.Gray)
+                        } else {
+                            index.apps.forEach { app ->
+                                Text("📱 ${app.name}", fontWeight = MaterialTheme.typography.h6.fontWeight)
+                                Spacer(Modifier.height(6.dp))
+                                app.activities.forEach { act ->
+                                    Text("  • ${act.name}", color = Color(0xFF444444))
+                                    Spacer(Modifier.height(6.dp))
+                                    act.entries.forEach { e ->
+                                        val title = "     — ${e.op} → ${e.hint}   [${e.selectors.size} selectors]"
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(vertical = 4.dp)
+                                                .background(
+                                                    if (selected?.file == e.file) Color(0xFFE8F0FF) else Color.Transparent,
+                                                    RoundedCornerShape(6.dp)
+                                                )
+                                                .clickable { onSelect(e) }
+                                                .padding(6.dp)
+                                        ) {
+                                            Text(
+                                                title,
+                                                color = Color(0xFF555555),
+                                                fontSize = TextUnit(12f, TextUnitType.Sp)
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.height(6.dp))
                                 }
+                                Spacer(Modifier.height(10.dp))
                             }
-                            Spacer(Modifier.height(6.dp))
                         }
-                        Spacer(Modifier.height(10.dp))
+                    }
+                } else {
+                    // --- flat "All memories" list (your MemoryBrowser condensed) ---
+                    LazyColumn(Modifier.fillMaxSize()) {
+                        items(flatItems.size) { i ->
+                            val e = flatItems[i]
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onSelect(e) }
+                                    .padding(vertical = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                Text(e.appPkg, Modifier.width(220.dp))
+                                Text(e.activity.substringAfterLast('.'), Modifier.width(180.dp))
+                                Text(e.op, Modifier.width(100.dp))
+                                Text(e.hint, Modifier.weight(1f))
+                                Text("${e.selectors.size} sel", Modifier.width(72.dp))
+                            }
+                            Divider()
+                        }
                     }
                 }
             }
         }
+
 
         Spacer(Modifier.width(16.dp))
 
@@ -794,9 +927,6 @@ private fun MemoryBrowserView(
                     Text("Select a memory entry on the left", color = Color.Gray)
                 }
             } else {
-                // --- inside your AppUi composable where `selected` is available ---
-
-// 1) Build nodes as a stateful list, and rebuild when `selected` changes
                 val nodes = remember(selected) {
                     val pkg = selected.appPkg
                     val activity = selected.activity
@@ -804,6 +934,13 @@ private fun MemoryBrowserView(
                     val hint = selected.hint
                     val selectorCount = selected.selectors.size
                     val screenTitle = guessScreenTitle(activity, hint)
+
+                    val enteredValue: String =
+                        "" // <— If you do have it (e.g. selected.value), replace "" with that variable.
+                    val opBody = if (op.equals("INPUT", true)) {
+                        val key = (hint ?: "value").removePrefix("TEXT_")
+                        if (enteredValue.isNotBlank()) "$key: $enteredValue" else key
+                    } else "…"
 
                     val startX = 100f
                     val y = 250f
@@ -835,7 +972,7 @@ private fun MemoryBrowserView(
                             color = Color(0xFFC5CAE9),
                             inputs = listOf(Port("in", "n_op", PortType.INPUT)),
                             outputs = listOf(Port("out", "n_op", PortType.OUTPUT)),
-                            body = "…"
+                            body = opBody   // <— was "…"
                         ),
                         Node(
                             id = "n_hint",
@@ -863,13 +1000,25 @@ private fun MemoryBrowserView(
                     mutableStateListOf<Connection>().also { it.addAll(autoConnect(nodes)) }
                 }
 
+                LaunchedEffect(selected) {
+                    autoArrangeNodes(
+                        nodes, connections,
+                        startX = 140f,
+                        startY = 160f,
+                        colGap = 460f,   // ← wider columns
+                        rowGap = 240f,   // ← more vertical space within a column
+                        diagStep = 150f   // ← bigger staircase rise per column
+                    )
+                }
+
+
                 // 3) Render stateless editor with state + callbacks
                 NodeGraphEditor(
                     nodes = nodes,
                     connections = connections,
-                    onNodePositionChange = { nodeId, dragAmount ->
+                    onNodePositionChange = { nodeId, drag ->
                         val i = nodes.indexOfFirst { it.id == nodeId }
-                        if (i != -1) nodes[i] = nodes[i].copy(position = nodes[i].position + dragAmount)
+                        if (i != -1) nodes[i] = nodes[i].copy(position = nodes[i].position + drag)
                     },
                     onNewConnection = { newConn ->
                         if (connections.none {
@@ -881,7 +1030,16 @@ private fun MemoryBrowserView(
                             connections.add(newConn)
                         }
                     },
-                    modifier = Modifier.fillMaxSize()
+                    onAutoArrange = {
+                        autoArrangeNodes(
+                            nodes, connections,
+                            startX = 140f,
+                            startY = 160f,
+                            colGap = 460f,
+                            rowGap = 240f,
+                            diagStep = 150f
+                        )
+                    }
                 )
             }
         }
@@ -1182,6 +1340,13 @@ fun AgentComponent(
 
                             val embedder = agent.semantic.GeminiEmbedder("AIzaSyBAB1n3XuO7Ra1wfrZNXPTWJRigDNvPtbE")
                             val reranker = agent.semantic.SemanticReranker(embedder)
+                            val memDir = File("memory").absoluteFile.apply { mkdirs() }
+
+                            val compMem = ComponentMemory(memDir)
+                            val selectorMem = ComponentMemoryAdapter(compMem)
+                            onLog("memory:store=${compMem.filePath()} entries=${compMem.stats().entries} selectors=${compMem.stats().selectors}")
+
+                            onLog("memory:store=${memDir.absolutePath} entries=${compMem.stats().entries} selectors=${compMem.stats().selectors}")
 
                             val result = AgentRunner(
                                 driver = driver,
@@ -1189,7 +1354,8 @@ fun AgentComponent(
                                 store = store,
                                 llmDisambiguator = gemini,
                                 semanticReranker = reranker,
-                                deki = dekiClient
+                                deki = dekiClient,
+                                memory = selectorMem
                             ).run(
                                 plan = p,
                                 onStep = { snap ->
@@ -1203,6 +1369,7 @@ fun AgentComponent(
                                 onStatus = onStatus,
                                 stopSignal = { stopRequested }
                             )
+                            onLog("memory:after-run entries=${compMem.stats().entries} selectors=${compMem.stats().selectors}")
                             onStatus("Done: ${result.count { it.success }}/${result.size} steps OK")
                         } catch (e: Exception) {
                             if (stopRequested) {

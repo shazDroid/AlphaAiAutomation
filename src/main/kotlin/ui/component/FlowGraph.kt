@@ -18,7 +18,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -32,7 +31,11 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.*
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -41,7 +44,7 @@ import kotlin.math.sqrt
 
 data class Node(
     val id: String,
-    val position: Offset,
+    val position: Offset,      // world-space position you control
     val title: String,
     val color: Color,
     val inputs: List<Port>,
@@ -49,7 +52,12 @@ data class Node(
     val body: String = "…"
 )
 
-data class Port(val id: String, val nodeId: String, val type: PortType)
+data class Port(
+    val id: String,
+    val nodeId: String,
+    val type: PortType
+)
+
 enum class PortType { INPUT, OUTPUT }
 
 data class Connection(
@@ -59,12 +67,70 @@ data class Connection(
     val toPortId: String
 )
 
+/** Connects each node to the next, using the first OUTPUT→first INPUT. */
 fun autoConnect(nodes: List<Node>): List<Connection> =
     nodes.windowed(2).mapNotNull { (a, b) ->
-        val from = a.outputs.firstOrNull()
-        val to = b.inputs.firstOrNull()
-        if (from != null && to != null) Connection(a.id, from.id, b.id, to.id) else null
+        val fromPort = a.outputs.firstOrNull()
+        val toPort = b.inputs.firstOrNull()
+        if (fromPort != null && toPort != null)
+            Connection(a.id, fromPort.id, b.id, toPort.id)
+        else null
     }
+
+/**
+ * Auto-arrange nodes into a left→right layered layout with a gentle staircase.
+ * Keeps your API the same: call autoArrangeNodes(nodes, connections).
+ */
+fun autoArrangeNodes(
+    nodes: MutableList<Node>,
+    connections: List<Connection>,
+    startX: Float = 180f,
+    startY: Float = 120f,
+    colGap: Float = 320f,   // horizontal spacing between columns
+    rowGap: Float = 170f,   // vertical spacing between nodes in the same column
+    diagStep: Float = 90f   // extra Y added per column to create the staircase
+) {
+    if (nodes.isEmpty()) return
+
+    val idx = nodes.indices.associateBy { nodes[it].id }
+    val out = connections.groupBy { it.fromNodeId }.mapValues { it.value.map { c -> c.toNodeId } }
+    val indeg = mutableMapOf<String, Int>().apply { nodes.forEach { this[it.id] = 0 } }
+    connections.forEach { indeg[it.toNodeId] = (indeg[it.toNodeId] ?: 0) + 1 }
+
+    // Kahn-style layering; if no true source, pick the left-most node as a source
+    val sources = nodes.map { it.id }.filter { (indeg[it] ?: 0) == 0 }
+        .ifEmpty { listOf(nodes.minBy { it.position.x }.id) }
+
+    val level = mutableMapOf<String, Int>()
+    val q = ArrayDeque<String>().apply { sources.forEach { level[it] = 0; add(it) } }
+
+    while (q.isNotEmpty()) {
+        val u = q.removeFirst()
+        val lu = level[u] ?: 0
+        for (v in out[u].orEmpty()) {
+            val cur = level[v]
+            if (cur == null || lu + 1 < cur) level[v] = lu + 1
+            val left = (indeg[v] ?: 1) - 1
+            indeg[v] = left
+            if (left == 0) q += v
+        }
+    }
+    // Unreached nodes get level 0
+    nodes.forEach { level.putIfAbsent(it.id, 0) }
+
+    // Place by column; each column gets a slight +Y shift (diagStep) to create the staircase
+    val byCol = level.entries.groupBy({ it.value }, { it.key }).toSortedMap()
+    byCol.forEach { (col, ids) ->
+        val baseX = startX + col * colGap
+        var y = startY + col * diagStep
+        ids.sortedBy { idx[it] }.forEach { id ->
+            val i = idx[id] ?: return@forEach
+            nodes[i] = nodes[i].copy(position = Offset(baseX, y))
+            y += rowGap
+        }
+    }
+}
+
 
 /* =============== Editor =============== */
 
@@ -75,42 +141,42 @@ fun NodeGraphEditor(
     connections: List<Connection>,
     onNodePositionChange: (nodeId: String, dragAmount: Offset) -> Unit,
     onNewConnection: (Connection) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onAutoArrange: (() -> Unit)? = null   // <— optional; doesn’t break existing call sites
 ) {
+    // Camera
     var canvasOffset by remember { mutableStateOf(Offset.Zero) }
     var scale by remember { mutableStateOf(1f) }
 
+    // Wire drag
     var connectionDragState by remember { mutableStateOf<ConnectionDragState?>(null) }
+
+    // Port centers in editor-local coordinates (so the wire canvas doesn’t need transforms)
     val portPositions = remember { mutableStateMapOf<String, Offset>() }
     val allPorts = remember(nodes) { nodes.flatMap { it.inputs + it.outputs } }
 
-    val density = LocalDensity.current
+    // Editor origin in root; used to convert port centers to editor-local
     var editorOrigin by remember { mutableStateOf(Offset.Zero) }
-    var viewport by remember { mutableStateOf(IntSize.Zero) }      // editor size in px
-    val nodeSizes = remember { mutableStateMapOf<String, IntSize>() } // node sizes in px
-    val marginPx = with(density) { 12.dp.toPx() }
+    val density = LocalDensity.current
 
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(Color(0xFFF8F9FA))
-            .clipToBounds()                                        // NEW: clip everything to editor
-            .onGloballyPositioned {
-                editorOrigin = it.positionInRoot()
-                viewport = it.size
-            }
+            .onGloballyPositioned { editorOrigin = it.positionInRoot() }
             .pointerInput(Unit) {
+                // Zoom via scroll (grid stays screen-space; see next Canvas)
                 awaitPointerEventScope {
                     while (true) {
-                        val ev = awaitPointerEvent()
-                        if (ev.type == PointerEventType.Scroll) {
-                            val d = ev.changes.first().scrollDelta.y
-                            val newScale = (scale - d * 0.1f).coerceIn(0.2f, 3f)
-                            val p = ev.changes.first().position
+                        val event = awaitPointerEvent()
+                        if (event.type == PointerEventType.Scroll) {
+                            val dy = event.changes.first().scrollDelta.y
+                            val newScale = (scale - dy * 0.1f).coerceIn(0.2f, 3f)
+                            val p = event.changes.first().position
                             val ratio = newScale / scale
                             canvasOffset = p * (1 - ratio) + canvasOffset * ratio
                             scale = newScale
-                            ev.changes.first().consume()
+                            event.changes.first().consume()
                         }
                     }
                 }
@@ -122,35 +188,26 @@ fun NodeGraphEditor(
                 }
             }
     ) {
-        // grid
+        // Screen-space dotted grid (grows with zoom, fills viewport)
         Canvas(Modifier.fillMaxSize()) {
-            // grid spacing in PX that scales with zoom
             val base = 20.dp.toPx()
-            val step = (base * scale).coerceAtLeast(8f) // avoid sub-pixel clutter when zoomed out
-
-            // anchor the pattern to the camera so it always fills the viewport
+            val step = (base * scale).coerceAtLeast(8f)
             fun posMod(a: Float, b: Float): Float = ((a % b) + b) % b
             val startX = posMod(-canvasOffset.x, step)
             val startY = posMod(-canvasOffset.y, step)
-
             var x = startX
             while (x < size.width) {
                 var y = startY
                 while (y < size.height) {
-                    drawCircle(
-                        color = Color.LightGray.copy(alpha = 0.5f),
-                        radius = 2f,
-                        center = Offset(x, y)
-                    )
+                    drawCircle(Color.LightGray.copy(alpha = 0.5f), radius = 2f, center = Offset(x, y))
                     y += step
                 }
                 x += step
             }
         }
 
-
-        // connections
-        Canvas(Modifier.fillMaxSize().clipToBounds()) {           // NEW: clip wires
+        // Wires
+        Canvas(Modifier.fillMaxSize()) {
             connections.forEach { c ->
                 val s = portPositions["${c.fromNodeId}_${c.fromPortId}"]
                 val e = portPositions["${c.toNodeId}_${c.toPortId}"]
@@ -162,28 +219,13 @@ fun NodeGraphEditor(
             }
         }
 
-        // nodes
+        // Nodes
         nodes.forEach { node ->
             GraphNode(
                 node = node,
-                offset = node.position * scale + canvasOffset,     // screen coords
+                offset = node.position * scale + canvasOffset,
                 scale = scale,
-                onMeasured = { nodeSizes[node.id] = it },
-                onPositionChange = { dragScreen ->
-                    val size = nodeSizes[node.id]
-                    if (size == null || viewport == IntSize.Zero) {
-                        // no measure yet → just move by the drag, no clamp
-                        onNodePositionChange(node.id, dragScreen / scale)
-                    } else {
-                        // clamp in SCREEN space, then convert back to world
-                        val curScreen = worldToScreen(node.position, canvasOffset, scale)
-                        val wantedScreen = curScreen + dragScreen
-                        val clampedScreen = clampScreen(wantedScreen, size, viewport, marginPx)
-                        val newWorld = screenToWorld(clampedScreen, canvasOffset, scale)
-                        val deltaWorld = newWorld - node.position
-                        if (deltaWorld != Offset.Zero) onNodePositionChange(node.id, deltaWorld)
-                    }
-                },
+                onPositionChange = { drag -> onNodePositionChange(node.id, drag / scale) },
                 onPortPositioned = { port, posInRoot ->
                     portPositions["${port.nodeId}_${port.id}"] = posInRoot - editorOrigin
                 },
@@ -198,17 +240,17 @@ fun NodeGraphEditor(
                 },
                 onConnectionDragEnd = {
                     connectionDragState?.let { st ->
-                        val end = allPorts.find { p ->
-                            portPositions["${p.nodeId}_${p.id}"]?.let { pp ->
-                                (st.currentPosition - pp).getDistance() < 20.dp.toPx(density)
+                        val endPort = allPorts.find { port ->
+                            portPositions["${port.nodeId}_${port.id}"]?.let { p ->
+                                (st.currentPosition - p).getDistance() < 20.dp.toPx(density)
                             } == true
                         }
-                        if (end != null && st.startPort.type != end.type && st.startPort.nodeId != end.nodeId) {
+                        if (endPort != null && st.startPort.type != endPort.type && st.startPort.nodeId != endPort.nodeId) {
                             val newConn =
                                 if (st.startPort.type == PortType.OUTPUT)
-                                    Connection(st.startPort.nodeId, st.startPort.id, end.nodeId, end.id)
+                                    Connection(st.startPort.nodeId, st.startPort.id, endPort.nodeId, endPort.id)
                                 else
-                                    Connection(end.nodeId, end.id, st.startPort.nodeId, st.startPort.id)
+                                    Connection(endPort.nodeId, endPort.id, st.startPort.nodeId, st.startPort.id)
                             onNewConnection(newConn)
                         }
                     }
@@ -217,7 +259,7 @@ fun NodeGraphEditor(
             )
         }
 
-        // zoom controls
+        // Zoom + optional Auto button (keeps API backwards compatible)
         Column(
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -227,6 +269,9 @@ fun NodeGraphEditor(
             }
             Button(onClick = { scale = (scale / 1.2f).coerceIn(0.2f, 3f) }) {
                 Icon(Icons.Default.KeyboardArrowDown, contentDescription = "Zoom Out")
+            }
+            if (onAutoArrange != null) {
+                Button(onClick = onAutoArrange) { Text("Auto") }
             }
         }
     }
@@ -241,7 +286,6 @@ private fun GraphNode(
     node: Node,
     offset: Offset,
     scale: Float,
-    onMeasured: (IntSize) -> Unit,
     onPositionChange: (Offset) -> Unit,
     onPortPositioned: (Port, Offset) -> Unit,
     onConnectionDragStart: (Port) -> Unit,
@@ -251,17 +295,18 @@ private fun GraphNode(
     Box(
         modifier = Modifier
             .offset { IntOffset(offset.x.roundToInt(), offset.y.roundToInt()) }
-            .onGloballyPositioned { onMeasured(it.size) }
             .width((240 * scale).dp)
             .shadow((8 * scale).dp, RoundedCornerShape((12 * scale).dp))
             .background(Color.White, RoundedCornerShape((12 * scale).dp))
             .pointerInput(node.id) {
-                detectDragGestures { change, dragAmount ->
-                    change.consume(); onPositionChange(dragAmount)
+                detectDragGestures { change, drag ->
+                    change.consume()
+                    onPositionChange(drag)
                 }
             }
     ) {
         Column {
+            // header
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -339,11 +384,15 @@ private fun PortHandle(
             .onGloballyPositioned { lc ->
                 val p = lc.positionInRoot()
                 val center = Offset(p.x + lc.size.width / 2, p.y + lc.size.height / 2)
-                onPositioned(port, center)
+                onPositioned(port, center) // report in root; editor converts to local
             }
             .pointerInput(port.id) {
-                detectDragGestures(onDragStart = { onDragStart(port) }, onDragEnd = { onDragEnd() }) { change, drag ->
-                    change.consume(); onDrag(drag)
+                detectDragGestures(
+                    onDragStart = { onDragStart(port) },
+                    onDragEnd = { onDragEnd() }
+                ) { change, drag ->
+                    change.consume()
+                    onDrag(drag)
                 }
             },
         contentAlignment = Alignment.Center
@@ -354,20 +403,11 @@ private fun PortHandle(
 
 /* =============== Drawing helpers =============== */
 
-private fun DrawScope.drawGrid(gridSize: Float, color: Color, scale: Float) {
-    val w = size.width / scale + gridSize
-    val h = size.height / scale + gridSize
-    val step = gridSize.toInt()
-    for (x in 0..w.toInt() step step)
-        for (y in 0..h.toInt() step step)
-            drawCircle(color, radius = 2f, center = Offset(x.toFloat(), y.toFloat()))
-}
-
 private fun DrawScope.drawConnection(start: Offset, end: Offset, color: Color = Color(0xFFFD9644)) {
     val path = Path().apply {
         moveTo(start.x, start.y)
-        val d = ((end.x - start.x) / 2f).coerceAtLeast(100f)
-        cubicTo(start.x + d, start.y, end.x - d, end.y, end.x, end.y)
+        val c = ((end.x - start.x) / 2f).coerceAtLeast(100f)
+        cubicTo(start.x + c, start.y, end.x - c, end.y, end.x, end.y)
     }
     drawPath(path, color = color, style = Stroke(width = 3.dp.toPx()))
 }
@@ -382,58 +422,61 @@ private fun Dp.toPx(density: Density): Float = with(density) { this@toPx.toPx() 
 fun NodeGraphEditorPreview() {
     val nodes = remember {
         mutableStateListOf(
+            Node("A", Offset(0f, 0f), "App", Color(0xFFF9A825), emptyList(), listOf(Port("o", "A", PortType.OUTPUT))),
             Node(
-                "n_app",
-                Offset(100f, 250f),
-                "Sample App",
-                Color(0xFFF9A825),
-                emptyList(),
-                listOf(Port("out", "n_app", PortType.OUTPUT))
+                "B",
+                Offset(0f, 0f),
+                "Screen",
+                Color(0xFFD6C6E1),
+                listOf(Port("i", "B", PortType.INPUT)),
+                listOf(Port("o", "B", PortType.OUTPUT))
             ),
             Node(
-                "n_screen", Offset(400f, 250f), "Sample Screen", Color(0xFFD6C6E1),
-                listOf(Port("in", "n_screen", PortType.INPUT)), listOf(Port("out", "n_screen", PortType.OUTPUT))
+                "C",
+                Offset(0f, 0f),
+                "Op",
+                Color(0xFFC5CAE9),
+                listOf(Port("i", "C", PortType.INPUT)),
+                listOf(Port("o", "C", PortType.OUTPUT))
+            ),
+            Node(
+                "D",
+                Offset(0f, 0f),
+                "Hint",
+                Color(0xFFC8E6C9),
+                listOf(Port("i", "D", PortType.INPUT)),
+                listOf(Port("o", "D", PortType.OUTPUT))
+            ),
+            Node(
+                "E",
+                Offset(0f, 0f),
+                "Selector",
+                Color(0xFFFFF3E0),
+                listOf(Port("i", "E", PortType.INPUT)),
+                emptyList()
             )
         )
     }
-    val connections = remember(nodes) { mutableStateListOf<Connection>().also { it.addAll(autoConnect(nodes)) } }
+    val connections = remember(nodes) {
+        mutableStateListOf<Connection>().also { it.addAll(autoConnect(nodes)) }
+    }
+
+    LaunchedEffect(Unit) { autoArrangeNodes(nodes, connections) }
 
     Box(Modifier.size(1200.dp, 800.dp)) {
         NodeGraphEditor(
-            nodes, connections,
-            onNodePositionChange = { id, d ->
-                nodes.indexOfFirst { it.id == id }.takeIf { it >= 0 }?.let { i ->
-                    nodes[i] = nodes[i].copy(position = nodes[i].position + d)
-                }
+            nodes = nodes,
+            connections = connections,
+            onNodePositionChange = { id, drag ->
+                val i = nodes.indexOfFirst { it.id == id }
+                if (i != -1) nodes[i] = nodes[i].copy(position = nodes[i].position + drag)
             },
             onNewConnection = { new ->
-                if (connections.none { it.fromNodeId == new.fromNodeId && it.fromPortId == new.fromPortId && it.toNodeId == new.toNodeId && it.toPortId == new.toPortId })
+                if (connections.none { it.fromNodeId == new.fromNodeId && it.fromPortId == new.fromPortId && it.toNodeId == new.toNodeId && it.toPortId == new.toPortId }) {
                     connections.add(new)
-            }
+                }
+            },
+            onAutoArrange = { autoArrangeNodes(nodes, connections) }
         )
     }
 }
-
-private fun worldToScreen(world: Offset, canvasOffsetPx: Offset, scale: Float): Offset =
-    world * scale + canvasOffsetPx
-
-private fun screenToWorld(screen: Offset, canvasOffsetPx: Offset, scale: Float): Offset =
-    (screen - canvasOffsetPx) / scale
-
-private fun clampScreen(
-    posScreen: Offset,
-    nodeSizePx: IntSize,
-    viewportPx: IntSize,
-    marginPx: Float
-): Offset {
-    if (viewportPx == IntSize.Zero) return posScreen
-    val minX = marginPx
-    val minY = marginPx
-    val maxX = viewportPx.width - nodeSizePx.width - marginPx
-    val maxY = viewportPx.height - nodeSizePx.height - marginPx
-    return Offset(
-        x = posScreen.x.coerceIn(minX, maxX),
-        y = posScreen.y.coerceIn(minY, maxY)
-    )
-}
-

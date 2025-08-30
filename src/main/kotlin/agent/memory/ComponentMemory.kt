@@ -3,6 +3,7 @@ package agent.memory
 import agent.Locator
 import agent.StepType
 import agent.Strategy
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
@@ -15,6 +16,13 @@ import java.util.concurrent.ConcurrentHashMap
  */
 class ComponentMemory(dir: File) {
 
+    val mapper = ObjectMapper()
+        .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+        .registerKotlinModule()
+
+    private val file = File(dir, "components.json").absoluteFile
+    private val data = ConcurrentHashMap<String, Entry>()  // keyId -> Entry
+
     data class Key(val pkg: String, val activity: String, val op: StepType, val hint: String) {
         fun id(): String = listOf(pkg, activity, op.name, hint.lowercase()).joinToString("||")
     }
@@ -26,12 +34,10 @@ class ComponentMemory(dir: File) {
         var failures: Int = 0,
         var lastSeen: Long = System.currentTimeMillis()
     ) {
-        val score: Int
-            get() = successes * 3 - failures * 2
+        val score get() = successes * 3 - failures * 2
 
         companion object {
-            fun fromLocator(loc: Locator): MemSelector =
-                MemSelector(strategy = loc.strategy, value = loc.value)
+            fun fromLocator(loc: Locator) = MemSelector(loc.strategy, loc.value)
         }
     }
 
@@ -41,69 +47,88 @@ class ComponentMemory(dir: File) {
         val op: StepType,
         val hint: String,
         val selectors: MutableList<MemSelector> = mutableListOf()
-    ) {
-        fun key(): Key = Key(pkg, activity, op, hint)
+    )
+
+    init {
+        load()
     }
+
+    fun filePath(): String = file.path
 
     data class Stats(val entries: Int, val selectors: Int)
 
-    private val mapper = ObjectMapper().registerKotlinModule()
-    private val root = File(dir, "components.json").apply { parentFile.mkdirs(); if (!exists()) writeText("{}") }
-    private val mem: ConcurrentHashMap<String, Entry> = ConcurrentHashMap(loadAll())
+    fun stats(): Stats = Stats(
+        entries = data.size,
+        selectors = data.values.sumOf { it.selectors.size }
+    )
 
-    private fun loadAll(): Map<String, Entry> =
-        runCatching { mapper.readValue<Map<String, Entry>>(root) }.getOrElse { emptyMap() }
+    /** Accessors */
+    fun get(key: Key): Entry? = data[key.id()]
 
-    private fun persist() {
-        runCatching { mapper.writerWithDefaultPrettyPrinter().writeValue(root, mem) }
+    fun getSelectors(key: Key): List<MemSelector> {
+        val sels = data[key.id()]?.selectors ?: emptyList()
+        return sels.toList() // return a copy
     }
 
-    fun keyFor(pkg: String, activity: String?, op: StepType, hint: String): Key =
-        Key(pkg = pkg.trim(), activity = (activity ?: "").trim(), op = op, hint = hint.trim())
-
-    fun bestFor(key: Key): MemSelector? =
-        mem[key.id()]?.selectors?.maxByOrNull { it.score }
-
     fun markSuccess(key: Key, sel: MemSelector) {
-        val id = key.id()
-        val e = mem.getOrPut(id) { Entry(key.pkg, key.activity, key.op, key.hint) }
-        val existing = e.selectors.firstOrNull { it.strategy == sel.strategy && it.value == sel.value }
-        if (existing == null) {
-            sel.successes = 1; sel.failures = 0; sel.lastSeen = System.currentTimeMillis()
-            e.selectors.add(sel)
-        } else {
-            existing.successes += 1; existing.lastSeen = System.currentTimeMillis()
-        }
-        // keep top 6 by score to avoid bloat
-        e.selectors.sortByDescending { it.score }
-        while (e.selectors.size > 6) e.selectors.removeLast()
-        persist()
+        upsert(key, sel) { it.successes++ }
+        save()
     }
 
     fun markFailure(key: Key, sel: MemSelector) {
+        upsert(key, sel) { it.failures++ }
+        save()
+    }
+
+    private fun upsert(key: Key, sel: MemSelector, mutate: (MemSelector) -> Unit) {
         val id = key.id()
-        val e = mem.getOrPut(id) { Entry(key.pkg, key.activity, key.op, key.hint) }
+        val e = data.getOrPut(id) { Entry(key.pkg, key.activity, key.op, key.hint) }
         val existing = e.selectors.firstOrNull { it.strategy == sel.strategy && it.value == sel.value }
         if (existing == null) {
-            sel.failures = 1; sel.lastSeen = System.currentTimeMillis()
-            e.selectors.add(sel)
+            mutate(sel)
+            sel.lastSeen = System.currentTimeMillis()
+            e.selectors += sel
         } else {
-            existing.failures += 1; existing.lastSeen = System.currentTimeMillis()
+            mutate(existing)
+            existing.lastSeen = System.currentTimeMillis()
         }
-        // prune very bad selectors
-        e.selectors.removeAll { it.failures >= 3 && it.score < 0 }
-        persist()
     }
 
-    fun stats(): Stats {
-        val entries = mem.size
-        val selectors = mem.values.sumOf { it.selectors.size }
-        return Stats(entries, selectors)
+    private fun load() {
+        if (!file.exists()) return
+        runCatching {
+            val map: Map<String, Entry> = mapper.readValue(file)
+            data.clear()
+            data.putAll(map)
+        }.onFailure { println("memory:load error: ${it.message}") }
     }
 
-    fun listEntries(): List<Entry> = mem.values.sortedWith(
-        compareBy<Entry>({ it.pkg }, { it.activity }, { it.op.name }, { it.hint.lowercase() })
-    )
+    private fun save() {
+        runCatching {
+            file.parentFile?.mkdirs()
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            mapper.writerWithDefaultPrettyPrinter().writeValue(tmp, data)
+            // atomic-ish replace
+            java.nio.file.Files.move(
+                tmp.toPath(), file.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE
+            )
+        }.onFailure { println("memory:save error: ${it.message}") }
+    }
 
-    fun get(key: Key): Entry? = mem[key.id()]
+    // ADD: overload that returns a Key for success/failure paths
+    fun keyFor(pkg: String, activity: String, op: StepType, hintLower: String): Key =
+        Key(pkg = pkg, activity = activity, op = op, hint = hintLower)
+
+    fun keyFor(pkg: String, activity: String, op: String, hintLower: String): String =
+        "$pkg||$activity||$op||$hintLower"
+
+    fun getSelectors(key: String): List<MemSelector> =
+        (data[key]?.selectors ?: emptyList()).toList()
+
 }
+
+/** Convert stored selector to agent.Locator (strategy is already an enum here). */
+fun ComponentMemory.MemSelector.toLocator(): Locator =
+    Locator(strategy = this.strategy, value = this.value)

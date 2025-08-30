@@ -28,6 +28,7 @@ fun AlphaTabRow(
     ) {
         tabs.forEachIndexed { index, title ->
             AlphaTabButton(
+                modifier = Modifier.weight(1f),
                 text = title,
                 isSelected = selectedTabIndex == index,
                 isLoading = isLoadingTab(index),
@@ -39,6 +40,7 @@ fun AlphaTabRow(
 
 @Composable
 fun AlphaTabButton(
+    modifier: Modifier? = null,
     text: String,
     isSelected: Boolean,
     isLoading: Boolean = false,
@@ -46,9 +48,9 @@ fun AlphaTabButton(
 ) {
     Button(
         onClick = onClick,
-        modifier = Modifier
-            .padding(horizontal = 0.dp, vertical = 8.dp)
-            .height(40.dp),
+        modifier = modifier
+            ?.padding(horizontal = 4.dp, vertical = 8.dp)
+            ?.height(40.dp)!!,
         colors = ButtonDefaults.buttonColors(
             backgroundColor = if (isSelected) Color(BLUE) else Color.LightGray,
             contentColor = Color.White
