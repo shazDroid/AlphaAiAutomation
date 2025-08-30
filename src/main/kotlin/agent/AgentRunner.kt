@@ -21,6 +21,30 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
+/* =================================================================== */
+/* SelectorMemory: adapter interface for your memory store (ComponentMemory)
+   Implement this and pass to AgentRunner(memory = yourAdapter).
+   Example adapter (pseudocode):
+   class ComponentMemoryAdapter(private val mem: agent.memory.ComponentMemory): SelectorMemory {
+       override fun find(appPkg: String, activity: String?, op: StepType, hint: String?): List<Locator> =
+           mem.selectors(appPkg, activity ?: "", op.name, hint ?: "").map { Locator(it.strategy, it.value) }
+
+       override fun success(appPkg: String, activity: String?, op: StepType, hint: String?, locator: Locator) {
+           mem.upsertSelector(appPkg, activity ?: "", op.name, hint ?: "", locator.strategy, locator.value)
+       }
+
+       override fun failure(appPkg: String, activity: String?, op: StepType, hint: String?, prior: Locator) {
+           mem.markBad(appPkg, activity ?: "", op.name, hint ?: "", prior.strategy, prior.value)
+       }
+   }
+*/
+interface SelectorMemory {
+    fun find(appPkg: String, activity: String?, op: StepType, hint: String?): List<Locator>
+    fun success(appPkg: String, activity: String?, op: StepType, hint: String?, locator: Locator)
+    fun failure(appPkg: String, activity: String?, op: StepType, hint: String?, prior: Locator)
+}
+/* =================================================================== */
+
 class AgentRunner(
     private val driver: AndroidDriver,
     private val resolver: LocatorResolver,
@@ -28,7 +52,8 @@ class AgentRunner(
     private val llmDisambiguator: LlmDisambiguator? = null,
     private val semanticReranker: SemanticReranker? = null,
     private val selector: MultiAgentSelector? = null,
-    private val deki: DekiYoloClient? = null
+    private val deki: DekiYoloClient? = null,
+    private val memory: SelectorMemory? = null,        // memory adapter
 ) {
     private val DEFAULT_WAIT_TEXT_TIMEOUT_MS = 45_000L
     private val DEFAULT_TAP_TIMEOUT_MS = 20_000L
@@ -42,14 +67,15 @@ class AgentRunner(
     private var lastVision: VisionResult? = null
     private var lastVisionScope: String? = null
 
-    private var scopeTtlSteps: Int = 0
-    private fun setScope(s: String?) {
-        activeScope = s?.lowercase(); scopeTtlSteps = if (s == null) 0 else 3
-    }
+    private val flowStore = agent.memory.FlowGraphStore(java.io.File("graphs"))
+    private var flowRecorder: agent.memory.FlowRecorder? = null
 
-    private fun tickScopeTtl() {
-        if (scopeTtlSteps > 0) scopeTtlSteps--; if (scopeTtlSteps == 0) activeScope = null
-    }
+    private var scopeTtlSteps: Int = 0
+    private fun setScope(s: String?) { activeScope = s?.lowercase(); scopeTtlSteps = if (s == null) 0 else 3 }
+    private fun tickScopeTtl() { if (scopeTtlSteps > 0) scopeTtlSteps--; if (scopeTtlSteps == 0) activeScope = null }
+
+    private fun currentActivitySafe(): String =
+        runCatching { driver.currentActivity() }.getOrNull().orEmpty()
 
     fun run(
         plan: ActionPlan,
@@ -69,6 +95,16 @@ class AgentRunner(
         val out = mutableListOf<Snapshot>()
         onLog("Plan started: \"${plan.title}\" (${plan.steps.size} steps)")
         onLog(if (deki == null) "vision:disabled" else "vision:enabled")
+
+        val flowId = plan.title.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')
+        flowRecorder = agent.memory.FlowRecorder(
+            store = flowStore,
+            appPkg = runCatching { driver.currentPackage }.getOrNull().orEmpty(),
+            flowId = flowId.ifBlank { "flow" },
+            title = plan.title,
+            activityProvider = { runCatching { driver.currentActivity() }.getOrNull() }
+        )
+
         var pc = 0
         val steps = plan.steps
         val sel = selector ?: MultiAgentSelector(driver, llmDisambiguator)
@@ -79,7 +115,7 @@ class AgentRunner(
             return idx
         }
 
-        while (pc in steps.indices) {
+        mainLoop@ while (pc in steps.indices) {
             if (stopSignal()) {
                 onStatus("⏹️ Stopped by user")
                 onLog("⏹️ Stopped by user")
@@ -93,6 +129,14 @@ class AgentRunner(
             var ok = true
             var chosen: Locator? = null
             var notes: String? = null
+
+            fun captureAndAdvance() {
+                val snap = store.capture(step.index, step.type, step.targetHint, chosen, ok, notes)
+                flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
+                out += snap; onStep(snap)
+                if (!ok) return
+                pc += 1
+            }
 
             try {
                 ensureNotStopped()
@@ -116,21 +160,48 @@ class AgentRunner(
                             }
                         }
                         store.capture(step.index, step.type, step.targetHint, null, true, "LAUNCH_APP")
+                        flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                         handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
                     }
 
+                    /* ========================= INPUT_TEXT (memory-first) ========================= */
                     StepType.INPUT_TEXT -> {
                         refreshScopeIfHeadersGone(onLog)
                         val th = step.targetHint ?: error("Missing target for INPUT_TEXT")
                         val value = step.value ?: error("Missing value for INPUT_TEXT")
                         onStatus("Typing into \"$th\"")
 
+                        // MEMORY FIRST (no vision)
+                        var triedMemory: Locator? = null
+                        var memoryAdvanced = false
+
+                        val saved = findSavedSelectors(StepType.INPUT_TEXT, th)
+                        if (saved.isNotEmpty())
+                            onLog("memory: ${saved.size} selector(s) for INPUT_TEXT '$th' (act=${currentActivitySafe()})")
+
+                        for (loc in saved) {
+                            if (tryInputByLocator(loc, value, onLog)) {
+                                chosen = loc
+                                onLog("✓ input via memory selector")
+                                handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
+                                recordMemorySuccess(StepType.INPUT_TEXT, th, loc, triedMemory)
+                                captureAndAdvance()
+                                memoryAdvanced = true
+                                break
+                            } else {
+                                triedMemory = loc
+                            }
+                        }
+
+                        if (memoryAdvanced) continue
+
+
+                        // Fallback flow
                         chosen = withRetry<Locator>(
                             attempts = 3, delayMs = 650,
                             onError = { n, e -> onLog("  retry($n) INPUT_TEXT: ${e.message}") }) {
                             ensureNotStopped()
                             resolver.waitForStableUi()
-
                             val (xp, edit) = findEditTextForLabel(driver, th.trim(), th) { msg -> onLog("  $msg") }
                             ensureNotStopped()
                             runCatching { edit.click() }
@@ -138,12 +209,15 @@ class AgentRunner(
                             edit.sendKeys(value)
                             Locator(Strategy.XPATH, xp)
                         }
-
                         onLog("✓ input done")
                         handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
                         agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
+
+                        // Heal memory (store working selector, mark prior bad)
+                        recordMemorySuccess(StepType.INPUT_TEXT, th, chosen!!, triedMemory)
                     }
 
+                    /* ========================= TAP (memory-first) ========================= */
                     StepType.TAP -> {
                         refreshScopeIfHeadersGone(onLog)
 
@@ -156,76 +230,63 @@ class AgentRunner(
 
                         onStatus("Tapping \"$th\"")
                         ensureNotStopped()
-
                         agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
+
+                        // MEMORY FIRST (no vision, no pre-scroll)
+                        var triedMemory: Locator? = null
+                        var memoryAdvanced = false
+
+                        val savedTap = findSavedSelectors(StepType.TAP, th)
+                        if (savedTap.isNotEmpty()) {
+                            onLog("memory: ${savedTap.size} selector(s) for TAP '$th' (act=${currentActivitySafe()})")
+                        }
+                        for (loc in savedTap) {
+                            if (tryTapByLocator(loc, th, effectiveSection, onLog)) {
+                                chosen = loc
+                                onLog("✓ tapped via memory selector")
+                                handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
+                                recordMemorySuccess(StepType.TAP, th, loc, triedMemory)
+                                captureAndAdvance()
+                                memoryAdvanced = true
+                                break
+                            } else {
+                                triedMemory = loc
+                            }
+                        }
+                        if (memoryAdvanced) continue
+
+
+                        // Only scroll now if memory didn't work
                         ensureVisibleByAutoScrollBounded(th, preferredSection, step.index, step.type, 6, onLog)
 
-
-                        fun xpathLiteral(s: String): String = when {
-                            '\'' !in s -> "'$s'"
-                            '"' !in s -> "\"$s\""
-                            else -> "concat('${s.replace("'", "',\"'\",'")}')"
-                        }
-
+                        // ======== Full robust TAP pipeline ========
                         fun tokens(label: String): List<String> =
                             label.lowercase()
                                 .replace("&", " ")
                                 .split(Regex("\\s+"))
                                 .filter {
-                                    it.length >= 3 && it !in setOf(
-                                        "to",
-                                        "for",
-                                        "and",
-                                        "the",
-                                        "my",
-                                        "your",
-                                        "a",
-                                        "an",
-                                        "of",
-                                        "on",
-                                        "in",
-                                        "at",
-                                        "with"
-                                    )
+                                    it.length >= 3 && it !in setOf("to","for","and","the","my","your","a","an","of","on","in","at","with")
                                 }
 
-                        fun buildLocatorForElement(el: org.openqa.selenium.WebElement): String {
+                        fun buildLocatorForElement(el: WebElement): String {
                             fun a(name: String) = runCatching { el.getAttribute(name) }.getOrNull().orEmpty()
-                            val rid = a("resource-id"); if (rid.isNotBlank()) return "//*[@resource-id=${
-                                xpathLiteral(
-                                    rid
-                                )
-                            }]"
-                            val desc =
-                                a("content-desc"); if (desc.isNotBlank()) return "//*[@content-desc=${xpathLiteral(desc)}]"
-                            val txt =
-                                a("text"); if (txt.isNotBlank()) return "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
+                            val rid = a("resource-id"); if (rid.isNotBlank()) return "//*[@resource-id=${xpathLiteral(rid)}]"
+                            val desc = a("content-desc"); if (desc.isNotBlank()) return "//*[@content-desc=${xpathLiteral(desc)}]"
+                            val txt  = a("text");         if (txt.isNotBlank())  return "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
                             return "(.//*[@clickable='true'])[1]"
                         }
 
-                        fun firstClickableByTokens(label: String): Pair<Locator, org.openqa.selenium.WebElement>? {
+                        fun firstClickableByTokens(label: String): Pair<Locator, WebElement>? {
                             val toks = tokens(label)
                             if (toks.isEmpty()) return null
                             val cond = toks.joinToString(" and ") {
-                                "(contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${
-                                    xpathLiteral(
-                                        it
-                                    )
-                                }) or " +
-                                        "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${
-                                            xpathLiteral(
-                                                it
-                                            )
-                                        }))"
+                                "(contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${xpathLiteral(it)}) or " +
+                                        "contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${xpathLiteral(it)}))"
                             }
                             val xpClick = "//*[$cond][@clickable='true']"
-                            val clicks =
-                                runCatching { driver.findElements(AppiumBy.xpath(xpClick)) }.getOrNull().orEmpty()
+                            val clicks = runCatching { driver.findElements(AppiumBy.xpath(xpClick)) }.getOrNull().orEmpty()
                             val visibleClick = clicks.firstOrNull { it.isFullyVisible(driver) } ?: clicks.firstOrNull()
-                            if (visibleClick != null) return Locator(
-                                Strategy.XPATH,
-                                buildLocatorForElement(visibleClick)
-                            ) to visibleClick
+                            if (visibleClick != null) return Locator(Strategy.XPATH, buildLocatorForElement(visibleClick)) to visibleClick
 
                             val xpAny = "//*[$cond]"
                             val any = runCatching { driver.findElements(AppiumBy.xpath(xpAny)) }.getOrNull().orEmpty()
@@ -234,15 +295,11 @@ class AgentRunner(
                                 val xpAnc = "((//*[@resource-id=${xpathLiteral(hit.getAttribute("resource-id"))} or " +
                                         "@content-desc=${xpathLiteral(hit.getAttribute("content-desc"))} or " +
                                         "normalize-space(@text)=${xpathLiteral(hit.getAttribute("text"))}])/ancestor-or-self::*[@clickable='true'])[1]"
-                                val anc =
-                                    runCatching { driver.findElements(AppiumBy.xpath(xpAnc)) }.getOrNull().orEmpty()
-                                        .firstOrNull()
+                                val anc = runCatching { driver.findElements(AppiumBy.xpath(xpAnc)) }.getOrNull().orEmpty().firstOrNull()
                                 if (anc != null) return Locator(Strategy.XPATH, buildLocatorForElement(anc)) to anc
                             }
                             return null
                         }
-
-                        // REMOVE the old ensureVisibleByScroll() and its call
 
                         val tokTap = run {
                             val hit = firstClickableByTokens(th)
@@ -252,12 +309,11 @@ class AgentRunner(
                                 runCatching { hit.second.click() }
                                 chosen = hit.first
                                 lastTapY = runCatching { hit.second.rect.let { it.y + it.height / 2 } }.getOrNull()
-                                val dialogHandled = runCatching {
-                                    handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
-                                }.getOrDefault(false)
+                                val dialogHandled = runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }.getOrDefault(false)
                                 val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
                                 if (uiChanged) {
                                     val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                    flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                                     out += snap; onStep(snap); pc += 1
                                     true
                                 } else false
@@ -271,7 +327,9 @@ class AgentRunner(
                                 chosen = tapped
                                 handleDialogWithPolling(step.index, onLog, onStatus, 1400L)
                                 val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                                out += snap; onStep(snap); pc += 1; continue
+                                flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
+                                out += snap; onStep(snap); pc += 1
+                                continue
                             }
                         }
 
@@ -287,14 +345,13 @@ class AgentRunner(
                                     lastTapY = runCatching { el.rect.let { it.y + it.height / 2 } }.getOrNull()
                                     val vtmp = analyzeWithVisionFast("tap.fast.after", onLog, effectiveSection)
                                     setScope(determineScopeByY(lastTapY, vtmp) ?: activeScope)
-                                    val dialogHandled = runCatching {
-                                        handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
-                                    }.getOrDefault(false)
+                                    val dialogHandled = runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }.getOrDefault(false)
                                     val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
                                     if (uiChanged) {
-                                        val snap =
-                                            store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                                        out += snap; onStep(snap); pc += 1; return@run
+                                        val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                        flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
+                                        out += snap; onStep(snap); pc += 1
+                                        return@run
                                     }
                                 }
                             }
@@ -302,17 +359,12 @@ class AgentRunner(
 
                         val handledByVision: Boolean = run {
                             var vres = analyzeWithVisionFast("tap.pre", onLog, effectiveSection)
-                            val labelFound =
-                                vres?.elements?.any { it.text?.contains(th, ignoreCase = true) == true } == true
-                            if (!labelFound) {
-                                onLog("vision:tap.pre upgrade_to_ocr")
-                                vres = analyzeWithVisionSlowForText("tap.pre.ocr", onLog, effectiveSection)
-                            }
+                            val labelFound = vres?.elements?.any { it.text?.contains(th, ignoreCase = true) == true } == true
+                            if (!labelFound) { onLog("vision:tap.pre upgrade_to_ocr"); vres = analyzeWithVisionSlowForText("tap.pre.ocr", onLog, effectiveSection) }
                             if (vres == null) return@run false
                             logVisionSummary("tap.pre", vres, preferredSection, onLog)
 
-                            val vr =
-                                ScreenVision.findToggleForLabel(driver, vres, th, preferredSection) ?: return@run false
+                            val vr = ScreenVision.findToggleForLabel(driver, vres, th, preferredSection) ?: return@run false
                             val before = safePageSourceHash()
                             agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
                             runCatching { vr.second.click() }
@@ -320,23 +372,28 @@ class AgentRunner(
 
                             lastTapY = runCatching { vr.second.rect.let { it.y + it.height / 2 } }.getOrNull()
                             setScope(determineScopeByY(lastTapY, vres) ?: activeScope)
-                            val dialogHandled = runCatching {
-                                handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
-                            }.getOrDefault(false)
+                            val dialogHandled = runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }.getOrDefault(false)
                             val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
                             if (uiChanged) {
                                 val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                                 out += snap; onStep(snap); pc += 1; true
                             } else false
                         }
-                        if (handledByVision) continue
+                        if (handledByVision) {
+                            recordMemorySuccess(StepType.TAP, th, chosen!!, triedMemory)
+                            continue
+                        }
 
                         val toggleHit = tryToggleByLabel(th, preferredSection, desiredToggle, onLog)
                         if (toggleHit.first) {
                             chosen = toggleHit.second
                             handleDialogWithPolling(step.index, onLog, onStatus, 1400L)
                             val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                            out += snap; onStep(snap); pc += 1; continue
+                            flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
+                            out += snap; onStep(snap); pc += 1
+                            recordMemorySuccess(StepType.TAP, th, chosen!!, triedMemory)
+                            continue
                         }
 
                         val deadline = System.currentTimeMillis() + timeout
@@ -356,11 +413,7 @@ class AgentRunner(
                             if (all0.isEmpty()) { Thread.sleep(300); continue }
 
                             val vres = analyzeWithVisionFast("tap.loop", onLog, effectiveSection)
-                            val all = if (effectiveSection != null) applySectionScopeXY(
-                                all0,
-                                effectiveSection,
-                                vres
-                            ) else all0
+                            val all = if (effectiveSection != null) applySectionScopeXY(all0, effectiveSection, vres) else all0
 
                             fun norm(s: String?) = normalize(s)
                             val exact = all.filter { norm(it.label) == norm(th) }.toMutableList()
@@ -375,15 +428,11 @@ class AgentRunner(
                                     append("\nVISION_TEXTS: ").append(visionHint)
                                 }
                                 val pick = sel.select(instructionForSelector, all)
-                                pick.candidateId?.let { cid ->
-                                    all.firstOrNull { it.id == cid }?.let { choice -> ordered += choice }
-                                }
+                                pick.candidateId?.let { cid -> all.firstOrNull { it.id == cid }?.let { ordered += it } }
                             }
 
                             if (ordered.isEmpty() && semanticReranker != null) {
-                                val semTop = runCatching {
-                                    semanticReranker?.rerank(th, all)?.take(10)
-                                }.getOrDefault(emptyList())
+                                val semTop = runCatching { semanticReranker?.rerank(th, all)?.take(10) }.getOrDefault(emptyList())
                                 if (!semTop.isNullOrEmpty()) ordered += semTop
                             }
 
@@ -438,12 +487,12 @@ class AgentRunner(
                         if (chosen == null) throw IllegalStateException("Recorded selector missing after tap for \"$th\"")
                         onLog("✓ tapped")
                         handleDialogWithPolling(step.index, onLog, onStatus, 1600L)
-                        val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                        out += snap; onStep(snap); pc += 1; continue
+
+                        // Heal memory
+                        recordMemorySuccess(StepType.TAP, th, chosen!!, triedMemory)
                     }
 
-
-
+                    /* ========================= CHECK (memory-first) ========================= */
                     StepType.CHECK -> {
                         refreshScopeIfHeadersGone(onLog)
 
@@ -461,6 +510,32 @@ class AgentRunner(
                         onStatus("Checking \"$th\"")
                         ensureNotStopped()
 
+                        // MEMORY FIRST (no vision)
+                        // --- Memory-first (CHECK) ---
+                        var triedMemory: Locator? = null
+                        var memoryAdvanced = false
+
+                        val savedCheck = findSavedSelectors(StepType.CHECK, th)
+                        if (savedCheck.isNotEmpty()) {
+                            onLog("memory: ${savedCheck.size} selector(s) for CHECK '$th' (act=${currentActivitySafe()})")
+                        }
+                        for (loc in savedCheck) {
+                            if (tryCheckByLocator(loc, desired, onLog)) {
+                                chosen = loc
+                                onLog("✓ check via memory selector")
+                                handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
+                                recordMemorySuccess(StepType.CHECK, th, loc, triedMemory)
+                                captureAndAdvance()
+                                memoryAdvanced = true
+                                break
+                            } else {
+                                triedMemory = loc
+                            }
+                        }
+                        if (memoryAdvanced) continue
+
+
+
                         val pVision = run {
                             val v = analyzeWithVisionFast("check.find", onLog, effectiveSection)
                             if (v == null) null else ScreenVision.findToggleForLabel(driver, v, th, effectiveSection)
@@ -477,11 +552,9 @@ class AgentRunner(
                         } else {
                             val all = extractCandidatesForHint(driver, th, limit = 80)
                             val v = analyzeWithVision("check.hint", onLog)
-                            val thAug =
-                                if (v != null) th + "\n\nVISION_HINT::" + buildVisionHint(v, preferredSection) else th
+                            val thAug = if (v != null) th + "\n\nVISION_HINT::" + buildVisionHint(v, preferredSection) else th
                             val pickId = selector?.select(thAug, all)?.candidateId
-                            val xpUnion =
-                                "((//android.widget.CheckBox) | (//android.widget.Switch) | (//*[contains(@resource-id,'check') or contains(@resource-id,'tick') or contains(@content-desc,'check')]))[1]"
+                            val xpUnion = "((//android.widget.CheckBox) | (//android.widget.Switch) | (//*[contains(@resource-id,'check') or contains(@resource-id,'tick') or contains(@content-desc,'check')]))[1]"
                             val loc = all.firstOrNull { it.id == pickId }?.let { Locator(Strategy.XPATH, it.xpath) }
                                 ?: Locator(Strategy.XPATH, xpUnion)
                             val el = driver.findElement(loc.toBy())
@@ -491,11 +564,13 @@ class AgentRunner(
                             chosen = loc
                         }
                         handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
+
+                        // Heal memory
+                        recordMemorySuccess(StepType.CHECK, th, chosen!!, triedMemory)
                     }
 
                     StepType.WAIT_TEXT -> {
                         refreshScopeIfHeadersGone(onLog)
-
                         val q = (step.targetHint ?: step.value) ?: error("Missing query for WAIT_TEXT")
                         val timeout = step.meta["timeoutMs"]?.toLongOrNull() ?: DEFAULT_WAIT_TEXT_TIMEOUT_MS
                         onStatus("Waiting for \"$q\" (timeout ${timeout}ms)")
@@ -528,12 +603,10 @@ class AgentRunner(
                             runCatching { driver.findElements(AppiumBy.xpath(buildTokenXPathAny(th))) }
                                 .getOrNull().orEmpty().firstOrNull()
 
-                        // If already visible, do not scroll
                         val first = findAny()
                         if (first != null && first.isFullyVisible(driver)) {
                             onLog("auto-scroll skipped — \"$th\" already visible")
                             handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
-                            // fall through to end-of-step generic capture
                         } else {
                             onStatus("Scrolling to \"$th\"")
                             ensureNotStopped()
@@ -550,14 +623,12 @@ class AgentRunner(
 
                             if (swipes > 0) {
                                 onLog("auto-scroll ×$swipes for \"$th\"")
-                                // Silent snapshot (no extra Timeline row)
                                 store.capture(step.index, StepType.SCROLL_TO, th, null, true, "auto=1;count=$swipes")
+                                flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                             }
                             handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
                         }
                     }
-
-
 
                     StepType.WAIT_OTP -> {
                         val digits = step.value?.toIntOrNull() ?: 6
@@ -586,6 +657,7 @@ class AgentRunner(
                         driver.navigate().back()
                         onLog("✓ back")
                         store.capture(step.index, step.type, step.targetHint, null, true, null)
+                        flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                         handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
                     }
 
@@ -596,12 +668,14 @@ class AgentRunner(
                         while (slept < ms) { ensureNotStopped(); Thread.sleep(slice); slept += slice }
                         onLog("✓ wake")
                         store.capture(step.index, step.type, step.targetHint, null, true, null)
+                        flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                         handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
                     }
 
                     StepType.LABEL -> {
                         onLog("📍 label: ${step.targetHint}")
                         store.capture(step.index, step.type, step.targetHint, null, true, null)
+                        flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                     }
 
                     StepType.GOTO -> {
@@ -609,6 +683,7 @@ class AgentRunner(
                         onLog("↩︎ goto '$lbl'")
                         pc = jumpToLabelOrThrow(lbl)
                         val snap = store.capture(step.index, step.type, step.targetHint, null, true, null)
+                        flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                         onStep(snap); out += snap
                         continue
                     }
@@ -623,6 +698,7 @@ class AgentRunner(
                         onLog(if (hit) "✓ IF true → $tLbl" else "✓ IF false → $fLbl")
                         pc = jumpToLabelOrThrow(if (hit) tLbl else fLbl)
                         val snap = store.capture(step.index, step.type, step.targetHint, null, true, null)
+                        flowRecorder?.addStep(step.type, step.targetHint ?: step.value ?: step.type.name)
                         onStep(snap); out += snap
                         continue
                     }
@@ -632,7 +708,6 @@ class AgentRunner(
                         onStatus("Sliding \"$th\"")
                         withRetry(attempts = 2, delayMs = 500, onError = { n, e -> onLog("  retry($n) SLIDE: ${e.message}") }) {
                             ensureNotStopped()
-
                             agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
 
                             ensureVisibleByAutoScrollBounded(
@@ -657,24 +732,82 @@ class AgentRunner(
                 ok = false; notes = e.message; onStatus("❌ ${step.type} failed: ${e.message}"); onLog("❌ error: $e")
             }
 
-            val snap = store.capture(step.index, step.type, step.targetHint, chosen, ok, notes)
-            out += snap; onStep(snap)
-            if (!ok) break
-            pc += 1
+            captureAndAdvance()
         }
 
         onLog("Plan completed. Success ${out.count { it.success }}/${out.size}")
         return out
     }
 
-    // ---------- dialogs ----------
+    /* ========================== Memory helpers =========================== */
 
-    private fun handleDialogWithPolling(
-        stepIndex: Int,
-        onLog: (String) -> Unit,
-        onStatus: (String) -> Unit,
-        windowMs: Long
-    ): Boolean {
+    private fun tryTapByLocator(loc: Locator, hint: String, section: String?, onLog: (String) -> Unit): Boolean {
+        return try {
+            val by = loc.toBy()
+            var el: WebElement? = runCatching { driver.findElement(by) }.getOrNull()
+            if (el == null) return false
+
+            // if off-screen, auto-scroll a bit to surface it
+            var i = 0
+            while (el != null && !el!!.isFullyVisible(driver) && i++ < 6) {
+                agent.ui.Gestures.standardScrollUp(driver)
+                resolver.waitForStableUi()
+                el = runCatching { driver.findElement(by) }.getOrNull()
+            }
+            el ?: return false
+
+            // click ancestor if needed
+            val clickEl = if (runCatching { el!!.getAttribute("clickable") }.getOrNull() == "true")
+                el!! else el!!.findElements(By.xpath("ancestor::*[@clickable='true'][1]")).firstOrNull() ?: el!!
+
+            val before = safePageSourceHash()
+            clickEl.click()
+            lastTapY = runCatching { clickEl.rect.let { it.y + it.height / 2 } }.getOrNull()
+            val vtmp = analyzeWithVisionFast("tap.mem.after", onLog, section)
+            setScope(determineScopeByY(lastTapY, vtmp) ?: activeScope)
+            val dialogHandled = runCatching { handleDialogWithPolling(-1, onLog, { }, 1200L) }.getOrDefault(false)
+            dialogHandled || waitUiChangedSince(before, 1500L)
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun tryInputByLocator(loc: Locator, value: String, onLog: (String) -> Unit): Boolean {
+        return try {
+            val by = loc.toBy()
+            var el: WebElement? = runCatching { driver.findElement(by) }.getOrNull() ?: return false
+            var i = 0
+            while (el != null && !el!!.isFullyVisible(driver) && i++ < 6) {
+                agent.ui.Gestures.standardScrollUp(driver)
+                resolver.waitForStableUi()
+                el = runCatching { driver.findElement(by) }.getOrNull()
+            }
+            el ?: return false
+            runCatching { el!!.click() }
+            el!!.clear()
+            el!!.sendKeys(value)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun tryCheckByLocator(loc: Locator, desired: Boolean?, onLog: (String) -> Unit): Boolean {
+        return try {
+            val by = loc.toBy()
+            val el = runCatching { driver.findElement(by) }.getOrNull() ?: return false
+            val isChecked = (runCatching { el.getAttribute("checked") }.getOrNull() ?: "false") == "true"
+            val want = desired ?: !isChecked
+            if (isChecked != want) el.click()
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /* ======================= dialogs / vision / utils ===================== */
+
+    private fun handleDialogWithPolling(stepIndex: Int, onLog: (String) -> Unit, onStatus: (String) -> Unit, windowMs: Long): Boolean {
         val start = System.currentTimeMillis()
         var handled = false
         while (System.currentTimeMillis() - start < windowMs) {
@@ -706,11 +839,9 @@ class AgentRunner(
     private data class DetectedDialog(val title: String?, val message: String?, val buttons: List<DialogBtn>, val rootXPath: String?)
 
     private fun detectBlockingDialog(): DetectedDialog? {
-        val btnNodes = driver.findElements(
-            AppiumBy.xpath(
-                "//*[self::android.widget.Button or (self::android.widget.TextView and @clickable='true') or (self::android.widget.CheckedTextView and @clickable='true')]"
-            )
-        )
+        val btnNodes = driver.findElements(AppiumBy.xpath(
+            "//*[self::android.widget.Button or (self::android.widget.TextView and @clickable='true') or (self::android.widget.CheckedTextView and @clickable='true')]"
+        ))
         if (btnNodes.isEmpty()) return null
         val labelSet = setOf("ok","okay","retry","try again","cancel","close","dismiss","continue","yes","no","allow","deny","got it","understood","confirm")
         val candidate = btnNodes.firstOrNull {
@@ -722,7 +853,12 @@ class AgentRunner(
         val rid = runCatching { container.getAttribute("resource-id") }.getOrNull()?.trim().orEmpty()
         val rootXp = if (rid.isNotEmpty()) "//*[@resource-id=${xpathLiteral(rid)}]" else null
         val titleEl = container.findElements(AppiumBy.xpath(".//*[@resource-id='android:id/alertTitle' or contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'title')][1]")).firstOrNull()
-        val msgElKnown = container.findElements(AppiumBy.xpath(".//*[@resource-id='android:id/message' or contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'message')][1]")).firstOrNull()
+        val msgElKnown = container.findElements(
+            AppiumBy.xpath(
+                ".//*[@resource-id='android:id/message' " +
+                        "or contains(translate(@resource-id,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'message')][1]"
+            )
+        ).firstOrNull()
         val nonClickableTexts = container.findElements(AppiumBy.xpath(".//android.widget.TextView[normalize-space(@text)!='' and @clickable='false']"))
         val messageEl = msgElKnown ?: nonClickableTexts.maxByOrNull { (runCatching { it.text }.getOrNull() ?: "").length }
         val titleElFinal = titleEl ?: nonClickableTexts.minByOrNull { (runCatching { it.text }.getOrNull() ?: "").length }
@@ -739,8 +875,6 @@ class AgentRunner(
         if (buttons.isEmpty()) return null
         return DetectedDialog(title = title, message = message, buttons = buttons, rootXPath = rootXp)
     }
-
-    // ---------- xpath helpers ----------
 
     private data class ValidatedXPath(val xpath: String, val element: WebElement)
 
@@ -775,8 +909,7 @@ class AgentRunner(
             val texts = el.findElements(By.xpath(".//android.widget.TextView[normalize-space(@text)!='' and @clickable='false']"))
                 .mapNotNull { runCatching { it.text }.getOrNull()?.trim() }.filter { it.isNotEmpty() }.distinct()
             val titleish = texts.filter { it.length in 3..40 && !it.endsWith(".") && it.count { ch -> ch.isWhitespace() } <= 4 }.sortedBy { it.length }
-            val picks =
-                buildList { addAll(titleish.take(3)); if (titleish.isEmpty() && texts.isNotEmpty()) add(texts.minBy { it.length }) }.distinct()
+            val picks = buildList { addAll(titleish.take(3)); if (titleish.isEmpty() && texts.isNotEmpty()) add(texts.minBy { it.length }) }.distinct()
             for (t in picks) {
                 out += "(//*[normalize-space(@text)=${xpathLiteral(t)}]/ancestor::*[@clickable='true'][1])"
                 out += "(" +
@@ -813,8 +946,6 @@ class AgentRunner(
     private fun ValidatedXPath.toLocatorWith(original: Locator): Locator =
         Locator(strategy = Strategy.XPATH, value = this.xpath, alternatives = listOf(original.strategy to original.value))
 
-    // ---------- helpers ----------
-
     private fun Locator.toBy(): By = when (strategy) {
         Strategy.XPATH -> By.xpath(value)
         Strategy.ID -> AppiumBy.id(value)
@@ -832,17 +963,11 @@ class AgentRunner(
             .replace(Regex("\\s+"), " ")
             .trim()
 
-    private fun strictEquals(hint: String, label: String?): Boolean =
-        normalize(label) == normalize(hint)
-
+    private fun strictEquals(hint: String, label: String?): Boolean = normalize(label) == normalize(hint)
     private fun nearEquals(hint: String, label: String?): Boolean = strictEquals(hint, label)
 
-    // ===== Column/row scoping =====
-
-    private data class Box(val x: Int, val y: Int, val w: Int, val h: Int) {
-        val cx get() = x + w / 2
-        val cy get() = y + h / 2
-    }
+    // ===== Column/row scoping & vision helpers =====
+    private data class Box(val x: Int, val y: Int, val w: Int, val h: Int) { val cx get() = x + w / 2; val cy get() = y + h / 2 }
 
     private fun detectHeaderBoxFromVision(v: VisionResult?, token: String): Box? {
         if (v == null) return null
@@ -851,9 +976,7 @@ class AgentRunner(
     }
 
     private fun detectHeaderBoxFromDom(token: String): Box? {
-        val xp = "//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')=${
-            xpathLiteral(token.lowercase())
-        }]"
+        val xp = "//*[translate(normalize-space(@text),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')=${xpathLiteral(token.lowercase())}]"
         val el = runCatching { driver.findElements(AppiumBy.xpath(xp)).firstOrNull() }.getOrNull() ?: return null
         val r = el.rect
         return Box(r.x, r.y, r.width, r.height)
@@ -897,7 +1020,6 @@ class AgentRunner(
                     else abs(b.cx - (fromB ?: toB!!).cx) < max((fromB ?: toB!!).w, 120)
                 }
             }
-
             Layout.VERTICAL, Layout.UNKNOWN -> {
                 val tY = fromB?.cy
                 val bY = toB?.cy
@@ -906,18 +1028,16 @@ class AgentRunner(
                     val cy = b.cy
                     when (preferred.lowercase()) {
                         "from" -> when {
-                            tY != null && bY != null -> cy in min(tY, bY)..max(tY, bY)    // between FROM & TO
-                            tY != null -> cy >= (tY + 4)                                    // below FROM
-                            bY != null -> cy < (bY - 4)                                     // above TO
+                            tY != null && bY != null -> cy in min(tY, bY)..max(tY, bY)
+                            tY != null -> cy >= (tY + 4)
+                            bY != null -> cy < (bY - 4)
                             else -> true
                         }
-
                         "to" -> when {
                             bY != null -> cy >= (bY + 4)
                             tY != null -> cy > (tY + 4)
                             else -> true
                         }
-
                         else -> true
                     }
                 }
@@ -949,9 +1069,7 @@ class AgentRunner(
             if (fromY != null) return cy >= fromY!! + 8
             return cy < toY!! - 8
         }
-
         fun inTo(cy: Int): Boolean = if (toY != null) cy >= toY!! + 8 else (fromY?.let { cy > it + 8 } ?: true)
-
         val filtered = all.filter {
             val rect = runCatching { driver.findElement(AppiumBy.xpath(it.xpath)).rect }.getOrNull()
             if (rect == null) true else {
@@ -963,28 +1081,17 @@ class AgentRunner(
                 }
             }
         }
-
-        val headerCy = when (preferred.lowercase()) {
-            "from" -> fromY
-            "to" -> toY
-            else -> null
-        }
+        val headerCy = when (preferred.lowercase()) { "from" -> fromY; "to" -> toY; else -> null }
         return if (headerCy == null) filtered else filtered.sortedBy {
             val r = runCatching { driver.findElement(AppiumBy.xpath(it.xpath)).rect }.getOrNull()
             if (r == null) Int.MAX_VALUE else abs((r.y + r.height / 2) - headerCy)
         }
     }
 
-    private fun preferByRolePosAndHeader(
-        list: List<UICandidate>,
-        section: String?,
-        v: VisionResult?
-    ): List<UICandidate> {
+    private fun preferByRolePosAndHeader(list: List<UICandidate>, section: String?, v: VisionResult?): List<UICandidate> {
         if (list.isEmpty()) return list
         val (fromB, toB) = getHeaderBoxes(v)
-        val header = when (section?.lowercase()) {
-            "from" -> fromB; "to" -> toB; else -> null
-        }
+        val header = when (section?.lowercase()) { "from" -> fromB; "to" -> toB; else -> null }
         return list.sortedWith(
             compareByDescending<UICandidate> {
                 val role = (it.role ?: "").lowercase()
@@ -999,8 +1106,6 @@ class AgentRunner(
             }
         )
     }
-
-    // ===== Section-aware direct text tap =====
 
     private fun tapByTextInSection(label: String, section: String, onLog: (String) -> Unit): Locator? {
         val candidates = findElementsByTextScoped(label, section)
@@ -1035,14 +1140,12 @@ class AgentRunner(
                 val splitX = if (fromB != null && toB != null) (fromB.cx + toB.cx) / 2 else (fromB?.cx ?: toB!!.cx)
                 val wantLeft = section.equals("from", true)
                 matched.filter { el ->
-                    val r = el.rect;
-                    val cx = r.x + r.width / 2
+                    val r = el.rect; val cx = r.x + r.width / 2
                     val onLeft = cx <= splitX
                     if (fromB != null && toB != null) if (wantLeft) onLeft else !onLeft
                     else abs(cx - (fromB ?: toB!!).cx) < max((fromB ?: toB!!).w, 120)
                 }
             }
-
             Layout.VERTICAL, Layout.UNKNOWN -> {
                 val tY = fromB?.cy
                 val bY = toB?.cy
@@ -1055,22 +1158,18 @@ class AgentRunner(
                             bY != null -> cy < (bY - 4)
                             else -> true
                         }
-
                         "to" -> when {
                             bY != null -> cy >= (bY + 4)
                             tY != null -> cy > (tY + 4)
                             else -> true
                         }
-
                         else -> true
                     }
                 }
             }
         }
 
-        val header = when (section.lowercase()) {
-            "from" -> fromB; "to" -> toB; else -> null
-        }
+        val header = when (section.lowercase()) { "from" -> fromB; "to" -> toB; else -> null }
         return if (header == null) filtered else filtered.sortedBy { el ->
             val r = el.rect
             abs((r.y + r.height / 2) - header.cy) + abs((r.x + r.width / 2) - header.cx) / 2
@@ -1140,7 +1239,6 @@ class AgentRunner(
 
     private fun determineScopeByY(y: Int?, v: VisionResult?): String? {
         if (y == null) return null
-
         fun fromYVision(): Int? = v?.elements?.firstOrNull { it.text?.equals("from", true) == true }?.y
         fun toYVision(): Int? = v?.elements?.firstOrNull { it.text?.equals("to", true) == true }?.y
 
@@ -1175,8 +1273,6 @@ class AgentRunner(
         }.onFailure { /* ignore */ }
     }
 
-    // ---------- FAST vision paths ----------
-
     private fun analyzeWithVisionFast(tag: String, onLog: (String) -> Unit, effectiveSection: String?): VisionResult? {
         val client = deki ?: run { onLog("vision:$tag disabled"); return null }
         val hash = safePageSourceHash()
@@ -1203,11 +1299,7 @@ class AgentRunner(
         lastVision = res; lastVisionHash = hash; lastVisionScope = effectiveSection; return res
     }
 
-    private fun analyzeWithVisionSlowForText(
-        tag: String,
-        onLog: (String) -> Unit,
-        effectiveSection: String?
-    ): VisionResult? {
+    private fun analyzeWithVisionSlowForText(tag: String, onLog: (String) -> Unit, effectiveSection: String?): VisionResult? {
         val client = deki ?: return null
         val shot = screenshotPng()
         val cropped = cropForScope(shot, effectiveSection)
@@ -1239,8 +1331,6 @@ class AgentRunner(
         }.getOrElse { png }
     }
 
-    // ===== Utility helpers you flagged missing =====
-
     private fun safePageSourceHash(): Int = runCatching { driver.pageSource.hashCode() }.getOrDefault(0)
 
     private fun waitUiChangedSince(prevHash: Int, timeoutMs: Long): Boolean {
@@ -1253,26 +1343,16 @@ class AgentRunner(
         return false
     }
 
-    private inline fun <T> withRetry(
-        attempts: Int,
-        delayMs: Long,
-        onError: (Int, Throwable) -> Unit = { _, _ -> },
-        block: () -> T
-    ): T {
+    private inline fun <T> withRetry(attempts: Int, delayMs: Long, onError: (Int, Throwable) -> Unit = { _, _ -> }, block: () -> T): T {
         var last: Throwable? = null
         repeat(attempts) { i ->
-            try {
-                return block()
-            } catch (e: Throwable) {
-                last = e; onError(i + 1, e); Thread.sleep(delayMs)
-            }
+            try { return block() } catch (e: Throwable) { last = e; onError(i + 1, e); Thread.sleep(delayMs) }
         }
         throw last ?: IllegalStateException("failed")
     }
 
     private fun isBusy(): Boolean {
-        val xp =
-            "//*[@indeterminate='true' and self::android.widget.ProgressBar] | //*[contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'progress') and @clickable='false']"
+        val xp = "//*[@indeterminate='true' and self::android.widget.ProgressBar] | //*[contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'progress') and @clickable='false']"
         return runCatching { driver.findElements(AppiumBy.xpath(xp)).isNotEmpty() }.getOrDefault(false)
     }
 
@@ -1280,9 +1360,7 @@ class AgentRunner(
         val start = System.currentTimeMillis()
         var sawBusy = false
         while (System.currentTimeMillis() - start < maxMs) {
-            if (isBusy()) {
-                sawBusy = true; Thread.sleep(200); continue
-            }
+            if (isBusy()) { sawBusy = true; Thread.sleep(200); continue }
             if (sawBusy) Thread.sleep(150)
             return sawBusy
         }
@@ -1297,14 +1375,12 @@ class AgentRunner(
     }
 
     private fun findSwitchOrCheckableForLabel(label: String, section: String?): Pair<Locator, WebElement>? {
-        // Vision hint (best effort)
         val vres = analyzeWithVision("toggle.find", onLog = { })
         if (vres != null) {
             val vr = ScreenVision.findToggleForLabel(driver, vres, label, section)
             if (vr != null) return vr
         }
 
-        // Pure DOM by label, optionally scoped to section by relative position to FROM/TO
         val lit = xpathLiteral(label.trim())
         val base = "//*[normalize-space(@text)=$lit]"
         val scoped = if (section == null) base else {
@@ -1324,9 +1400,8 @@ class AgentRunner(
         val switchOrCheck =
             container.findElements(AppiumBy.xpath(".//android.widget.Switch | .//*[@checkable='true']")).firstOrNull()
                 ?: run {
-                    val rowRight =
-                        container.findElements(AppiumBy.xpath(".//*[self::android.widget.Switch or @checkable='true']"))
-                            .maxByOrNull { it.rect.x + it.rect.width }
+                    val rowRight = container.findElements(AppiumBy.xpath(".//*[self::android.widget.Switch or @checkable='true']"))
+                        .maxByOrNull { it.rect.x + it.rect.width }
                     rowRight
                 }
         if (switchOrCheck != null) {
@@ -1336,64 +1411,6 @@ class AgentRunner(
         return null
     }
 
-    // Lowercasing tokenized contains() XPATH for label search
-    private fun buildTokenXPath(label: String): String {
-        fun xpathLiteral(s: String): String =
-            if ('\'' !in s) "'$s'" else "concat('${s.replace("'", "',\"'\",'")}')"
-
-        val toks = label.lowercase()
-            .replace("&", " ")
-            .split(Regex("\\s+"))
-            .filter {
-                it.length >= 3 && it !in setOf(
-                    "to",
-                    "for",
-                    "and",
-                    "the",
-                    "my",
-                    "your",
-                    "a",
-                    "an",
-                    "of",
-                    "on",
-                    "in",
-                    "at",
-                    "with"
-                )
-            }
-
-        if (toks.isEmpty()) return "//*" // fallback
-
-        val cond = toks.joinToString(" and ") {
-            "(contains(translate(@text,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${xpathLiteral(it)}) or " +
-                    " contains(translate(@content-desc,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),${
-                        xpathLiteral(
-                            it
-                        )
-                    }))"
-        }
-        return "//*[$cond]"
-    }
-
-    // Viewport-safe visibility check
-    private fun WebElement.isFullyVisible(driver: org.openqa.selenium.WebDriver): Boolean {
-        val vp = driver.manage().window().size
-        val r = this.rect
-        val topSafe = 40
-        val botSafe = vp.height - 40
-        return r.y >= topSafe && (r.y + r.height) <= botSafe
-    }
-
-    // Convenience re-query
-    private fun findFirstTokenMatch(driver: org.openqa.selenium.WebDriver, label: String)
-            : WebElement? =
-        runCatching {
-            val xp = buildTokenXPath(label)
-            driver.findElements(AppiumBy.xpath(xp)).firstOrNull()
-        }.getOrNull()
-
-    // ==== Auto-scroll gating helpers (DOM + Vision) ====
-
     private val STOPWORDS = setOf("to","for","and","the","my","your","a","an","of","on","in","at","with")
 
     private fun tokenList(label: String): List<String> = label.lowercase()
@@ -1402,7 +1419,6 @@ class AgentRunner(
         .map { it.trim('\'','"','.',',',':',';','!','?') }
         .filter { it.length >= 3 && it.any(Char::isLetter) && it !in STOPWORDS }
 
-    // OR-joined token XPath (looser than buildTokenXPath, which AND-joins)
     private fun buildTokenXPathAny(label: String): String {
         val toks = tokenList(label)
         if (toks.isEmpty()) return "//*"
@@ -1414,8 +1430,7 @@ class AgentRunner(
     }
 
     private fun findFirstTokenMatchAny(label: String): WebElement? =
-        runCatching { driver.findElements(AppiumBy.xpath(buildTokenXPathAny(label))) }
-            .getOrNull().orEmpty().firstOrNull()
+        runCatching { driver.findElements(AppiumBy.xpath(buildTokenXPathAny(label))) }.getOrNull().orEmpty().firstOrNull()
 
     private fun visionSeesLabelInViewport(label: String, section: String?): Boolean {
         val v = analyzeWithVisionFast("vis.check", { /* quiet */ }, section) ?: return false
@@ -1447,7 +1462,6 @@ class AgentRunner(
     ): Int {
         agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
         resolver.waitForStableUi()
-
         if (isTargetVisibleNow(label, section)) return 0
 
         var swipes = 0
@@ -1460,11 +1474,64 @@ class AgentRunner(
 
         if (swipes > 0) {
             onLog("auto-scroll ×$swipes before $stepType \"$label\"")
-            // Silent snapshot for script-gen; no extra Timeline row
             store.capture(stepIndex, StepType.SCROLL_TO, label, null, true, "auto=1;before=$stepType;count=$swipes")
+            flowRecorder?.addStep(StepType.SCROLL_TO, label)
         }
         return swipes
     }
 
+    private fun WebElement.isFullyVisible(driver: org.openqa.selenium.WebDriver): Boolean {
+        val vp = driver.manage().window().size
+        val r = this.rect
+        val topSafe = 40
+        val botSafe = vp.height - 40
+        return r.y >= topSafe && (r.y + r.height) <= botSafe
+    }
 
+    /* ======================= Memory aliasing & adapters =================== */
+
+    private fun pkgSafe(): String =
+        runCatching { driver.currentPackage }.getOrNull().orEmpty()
+
+    private fun activityAliases(raw: String, pkg: String): List<String> {
+        if (raw.isBlank()) return emptyList()
+        val r = raw.trim()
+        val base = r.removePrefix(".").substringAfterLast('.')
+        val full = if (r.startsWith(".")) "$pkg${r}" else r
+        val fullFromBase = if (base.isNotBlank()) "$pkg.$base" else ""
+        return listOfNotNull(
+            r.takeIf { it.isNotBlank() },
+            full.takeIf { it.isNotBlank() },
+            base.takeIf { it.isNotBlank() },
+            fullFromBase.takeIf { it.isNotBlank() && it != full }
+        ).distinct()
+    }
+
+    private fun findSavedSelectors(op: StepType, hint: String?): List<Locator> {
+        val mem = memory ?: return emptyList()
+        val pkg = pkgSafe()
+        val act = currentActivitySafe()
+
+        // Try multiple keys – exact activity, aliases, and finally “no activity”
+        val acts = activityAliases(act, pkg) + listOf(null, "")
+        val hits = mutableListOf<Locator>()
+        for (a in acts) {
+            runCatching { mem.find(pkg, a, op, hint) }
+                .onSuccess { if (it.isNotEmpty()) hits += it }
+        }
+        // de-dup by (strategy,value)
+        return hits.distinctBy { it.strategy to it.value }
+    }
+
+    private fun recordMemorySuccess(op: StepType, hint: String?, chosen: Locator, tried: Locator?) {
+        runCatching {
+            val mem = memory ?: return@runCatching
+            val pkg = pkgSafe()
+            val act = currentActivitySafe()
+            mem.success(pkg, act, op, hint, chosen)
+            if (tried != null && (tried.strategy != chosen.strategy || tried.value != chosen.value)) {
+                mem.failure(pkg, act, op, hint, tried)
+            }
+        }
+    }
 }
