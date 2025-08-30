@@ -18,14 +18,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.clipToBounds   // NEW
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
@@ -34,7 +33,6 @@ import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.*
-
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -125,14 +123,31 @@ fun NodeGraphEditor(
             }
     ) {
         // grid
-        Canvas(Modifier.fillMaxSize().clipToBounds()) {           // NEW: clip grid
-            withTransform({
-                translate(canvasOffset.x, canvasOffset.y); scale(scale, scale)
-            }) {
-                val grid = 20.dp.toPx()
-                drawGrid(grid, Color.LightGray.copy(alpha = 0.5f), scale)
+        Canvas(Modifier.fillMaxSize()) {
+            // grid spacing in PX that scales with zoom
+            val base = 20.dp.toPx()
+            val step = (base * scale).coerceAtLeast(8f) // avoid sub-pixel clutter when zoomed out
+
+            // anchor the pattern to the camera so it always fills the viewport
+            fun posMod(a: Float, b: Float): Float = ((a % b) + b) % b
+            val startX = posMod(-canvasOffset.x, step)
+            val startY = posMod(-canvasOffset.y, step)
+
+            var x = startX
+            while (x < size.width) {
+                var y = startY
+                while (y < size.height) {
+                    drawCircle(
+                        color = Color.LightGray.copy(alpha = 0.5f),
+                        radius = 2f,
+                        center = Offset(x, y)
+                    )
+                    y += step
+                }
+                x += step
             }
         }
+
 
         // connections
         Canvas(Modifier.fillMaxSize().clipToBounds()) {           // NEW: clip wires
