@@ -824,209 +824,224 @@ private fun MemoryBrowserView(
     selected: MemEntry?,
     onSelect: (MemEntry) -> Unit
 ) {
-    val memoryTabList = listOf("Tree", "All")
+    var tab by remember { mutableStateOf(0) }
+    val memoryTabList = listOf("Tree", "All", "Plans")
+
+    val allPlans = model.plan.PlanRegistry.plans            // SnapshotStateList<Plan>
+    val plans = allPlans.filter { it.status == model.plan.PlanStatus.SUCCESS }
+    var selectedPlanId by remember(allPlans.size) {         // reselect when list updates
+        mutableStateOf(plans.firstOrNull()?.id?.value)
+    }
+    val selectedPlan = plans.firstOrNull { it.id.value == selectedPlanId }
+
     Text("Store Memory", fontWeight = MaterialTheme.typography.h6.fontWeight)
     Spacer(Modifier.height(8.dp))
 
     Row(Modifier.fillMaxWidth()) {
 
-        // Left: hierarchical list (apps -> activities -> entries)
         RightCard(modifier = Modifier.weight(0.24f).height(680.dp), pad = 10.dp) {
-            var tab by remember { mutableStateOf(0) } // 0 = Tree, 1 = All
             val flatItems = remember(index) { flattenMemIndex(index) }
 
             Column(Modifier.fillMaxSize()) {
-                // Tabs
-                AlphaTabRow(selectedTabIndex = tab, tabs = memoryTabList, onTabSelected = {
-                    tab = it
-                })
+                AlphaTabRow(selectedTabIndex = tab, tabs = memoryTabList, onTabSelected = { tab = it })
                 Spacer(Modifier.height(8.dp))
 
-                if (tab == 0) {
-                    val scroll = rememberScrollState()
-                    Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
-                        if (index.apps.isEmpty()) {
-                            Text("No memory yet. Run the agent to learn selectors.", color = Color.Gray)
-                        } else {
-                            index.apps.forEach { app ->
-                                Text("📱 ${app.name}", fontWeight = MaterialTheme.typography.h6.fontWeight)
-                                Spacer(Modifier.height(6.dp))
-                                app.activities.forEach { act ->
-                                    Text("  • ${act.name}", color = Color(0xFF444444))
+                when (tab) {
+                    0 -> {
+                        val scroll = rememberScrollState()
+                        Column(Modifier.fillMaxSize().verticalScroll(scroll)) {
+                            if (index.apps.isEmpty()) {
+                                Text("No memory yet. Run the agent to learn selectors.", color = Color.Gray)
+                            } else {
+                                index.apps.forEach { app ->
+                                    Text("📱 ${app.name}", fontWeight = MaterialTheme.typography.h6.fontWeight)
                                     Spacer(Modifier.height(6.dp))
-                                    act.entries.forEach { e ->
-                                        val title = "     — ${e.op} → ${e.hint}   [${e.selectors.size} selectors]"
-                                        Row(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .padding(vertical = 4.dp)
-                                                .background(
-                                                    if (selected?.file == e.file) Color(0xFFE8F0FF) else Color.Transparent,
-                                                    RoundedCornerShape(6.dp)
+                                    app.activities.forEach { act ->
+                                        Text("  • ${act.name}", color = Color(0xFF444444))
+                                        Spacer(Modifier.height(6.dp))
+                                        act.entries.forEach { e ->
+                                            val title = "     — ${e.op} → ${e.hint}   [${e.selectors.size} selectors]"
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(vertical = 4.dp)
+                                                    .background(
+                                                        if (selected?.file == e.file) Color(0xFFE8F0FF) else Color.Transparent,
+                                                        RoundedCornerShape(6.dp)
+                                                    )
+                                                    .clickable { onSelect(e) }
+                                                    .padding(6.dp)
+                                            ) {
+                                                Text(
+                                                    title,
+                                                    color = Color(0xFF555555),
+                                                    fontSize = TextUnit(12f, TextUnitType.Sp)
                                                 )
-                                                .clickable { onSelect(e) }
-                                                .padding(6.dp)
-                                        ) {
-                                            Text(
-                                                title,
-                                                color = Color(0xFF555555),
-                                                fontSize = TextUnit(12f, TextUnitType.Sp)
-                                            )
+                                            }
                                         }
+                                        Spacer(Modifier.height(6.dp))
                                     }
-                                    Spacer(Modifier.height(6.dp))
+                                    Spacer(Modifier.height(10.dp))
                                 }
-                                Spacer(Modifier.height(10.dp))
                             }
                         }
                     }
-                } else {
-                    LazyColumn(Modifier.fillMaxSize()) {
-                        items(
-                            items = flatItems,
-                            key = { e -> "${e.appPkg}|${e.activity}|${e.op}|${e.hint}" }
-                        ) { e ->
-                            MemoryEntryCard(
-                                e = e,
-                                selected = selected?.let { s ->
-                                    s.appPkg == e.appPkg &&
-                                            s.activity == e.activity &&
-                                            s.op == e.op &&
-                                            s.hint == e.hint
-                                } ?: false,
-                                onSelect = onSelect
-                            )
+
+                    1 -> {
+                        LazyColumn(Modifier.fillMaxSize()) {
+                            items(
+                                items = flatItems,
+                                key = { e -> "${e.appPkg}|${e.activity}|${e.op}|${e.hint}" }
+                            ) { e ->
+                                MemoryEntryCard(
+                                    e = e,
+                                    selected = selected?.let { s ->
+                                        s.appPkg == e.appPkg && s.activity == e.activity && s.op == e.op && s.hint == e.hint
+                                    } ?: false,
+                                    onSelect = onSelect
+                                )
+                            }
                         }
+                    }
+
+                    else -> {
+                        PlanListPane(
+                            plans = plans,
+                            selectedId = selectedPlanId,
+                            onSelect = { selectedPlanId = it.id.value },
+                            modifier = Modifier.fillMaxSize()
+                        )
                     }
                 }
             }
         }
 
-
         Spacer(Modifier.width(16.dp))
 
-        // Right: Graph viewer using your NodeGraphEditor
         RightCard(modifier = Modifier.weight(0.52f).height(680.dp), pad = 6.dp) {
-            if (selected == null) {
-                Column(
-                    Modifier.fillMaxSize(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.Center
-                ) {
-                    Text("Select a memory entry on the left", color = Color.Gray)
+            if (tab == 2 && selectedPlan != null) {
+                BoxWithConstraints(Modifier.fillMaxSize()) {
+                    val nodes = remember(selectedPlan) { planToNodes(selectedPlan).toMutableStateList() }
+                    val connections = remember(nodes) { planToConnections(nodes).toMutableStateList() }
+
+                    LaunchedEffect(selectedPlan, maxWidth) {
+                        gridArrangeToFit(
+                            nodes = nodes,
+                            maxWidthDp = maxWidth.value,
+                            startX = 140f,
+                            startY = 160f,
+                            colGap = 420f,
+                            rowGap = 240f
+                        )
+                    }
+
+                    NodeGraphEditor(
+                        nodes = nodes,
+                        connections = connections,
+                        onNodePositionChange = { id, drag ->
+                            val i = nodes.indexOfFirst { it.id == id }
+                            if (i != -1) {
+                                val p = nodes[i].position + drag
+                                nodes[i] =
+                                    nodes[i].copy(position = Offset(p.x.coerceAtLeast(-100f), p.y.coerceAtLeast(-100f)))
+                            }
+                        },
+                        onNewConnection = { newConn ->
+                            if (connections.none {
+                                    it.fromNodeId == newConn.fromNodeId &&
+                                            it.fromPortId == newConn.fromPortId &&
+                                            it.toNodeId == newConn.toNodeId &&
+                                            it.toPortId == newConn.toPortId
+                                }) connections.add(newConn)
+                        },
+                        onAutoArrange = {
+                            gridArrangeToFit(
+                                nodes = nodes,
+                                maxWidthDp = maxWidth.value,
+                                startX = 140f,
+                                startY = 160f,
+                                colGap = 420f,
+                                rowGap = 240f
+                            )
+                        },
+                        graphKey = "plan_${selectedPlan.id.value}"
+                    )
                 }
             } else {
-                val nodes = remember(selected) {
-                    val pkg = selected.appPkg
-                    val activity = selected.activity
-                    val op = selected.op
-                    val hint = selected.hint
-                    val selectorCount = selected.selectors.size
-                    val screenTitle = guessScreenTitle(activity, hint)
-
-                    val enteredValue: String =
-                        "" // <— If you do have it (e.g. selected.value), replace "" with that variable.
-                    val opBody = if (op.equals("INPUT", true)) {
-                        val key = (hint ?: "value").removePrefix("TEXT_")
-                        if (enteredValue.isNotBlank()) "$key: $enteredValue" else key
-                    } else "…"
-
-                    val startX = 100f
-                    val y = 250f
-                    val gap = 300f
-
-                    mutableStateListOf(
-                        Node(
-                            id = "n_app",
-                            position = Offset(startX + 0 * gap, y),
-                            title = "App: $pkg",
-                            color = Color(0xFFF9A825),
-                            inputs = emptyList(),
-                            outputs = listOf(Port("out", "n_app", PortType.OUTPUT)),
-                            body = "…"
-                        ),
-                        Node(
-                            id = "n_screen",
-                            position = Offset(startX + 1 * gap, y),
-                            title = "Screen: $screenTitle",
-                            color = Color(0xFFD6C6E1),
-                            inputs = listOf(Port("in", "n_screen", PortType.INPUT)),
-                            outputs = listOf(Port("out", "n_screen", PortType.OUTPUT)),
-                            body = activity.substringAfterLast('.')
-                        ),
-                        Node(
-                            id = "n_op",
-                            position = Offset(startX + 2 * gap, y),
-                            title = "Op: $op",
-                            color = Color(0xFFC5CAE9),
-                            inputs = listOf(Port("in", "n_op", PortType.INPUT)),
-                            outputs = listOf(Port("out", "n_op", PortType.OUTPUT)),
-                            body = opBody   // <— was "…"
-                        ),
-                        Node(
-                            id = "n_hint",
-                            position = Offset(startX + 3 * gap, y),
-                            title = "Hint: $hint",
-                            color = Color(0xFFC8E6C9),
-                            inputs = listOf(Port("in", "n_hint", PortType.INPUT)),
-                            outputs = listOf(Port("out", "n_hint", PortType.OUTPUT)),
-                            body = "…"
-                        ),
-                        Node(
-                            id = "n_sel",
-                            position = Offset(startX + 4 * gap, y),
-                            title = "Selector ($selectorCount)",
-                            color = Color(0xFFFFF3E0),
-                            inputs = listOf(Port("in", "n_sel", PortType.INPUT)),
-                            outputs = emptyList(),
-                            body = "stored"
-                        )
-                    )
-                }
-
-                // 2) Seed connections from nodes (re-seed when nodes list object changes)
-                val connections = remember(nodes) {
-                    mutableStateListOf<Connection>().also { it.addAll(autoConnect(nodes)) }
-                }
-
-                val keyForGraph = selected?.let { "${it.appPkg}|${it.activity}|${it.op}|${it.hint}" } ?: "empty"
-
-                LaunchedEffect(selected) {
-                    autoArrangeNodes(
-                        nodes, connections,
-                        startX = 140f,
-                        startY = 160f,
-                        colGap = 460f,   // ← wider columns
-                        rowGap = 240f,   // ← more vertical space within a column
-                        diagStep = 150f   // ← bigger staircase rise per column
-                    )
-                }
-
-
-                // 3) Render stateless editor with state + callbacks
-                NodeGraphEditor(
-                    nodes = nodes,
-                    connections = connections,
-                    onNodePositionChange = { id, drag ->
-                        val i = nodes.indexOfFirst { it.id == id }
-                        if (i != -1) {
-                            val p = nodes[i].position + drag
-                            nodes[i] = nodes[i].copy(
-                                position = Offset(p.x.coerceAtLeast(-100f), p.y.coerceAtLeast(-100f))
+                if (selected == null) {
+                    Column(
+                        Modifier.fillMaxSize(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) { Text("Select a memory entry on the left", color = Color.Gray) }
+                } else {
+                    val nodes = remember(selected) {
+                        val pkg = selected.appPkg
+                        val activity = selected.activity
+                        val op = selected.op
+                        val hint = selected.hint
+                        val selectorCount = selected.selectors.size
+                        val screenTitle = guessScreenTitle(activity, hint)
+                        val enteredValue: String = ""
+                        val opBody = if (op.equals("INPUT", true)) {
+                            val key = (hint ?: "value").removePrefix("TEXT_")
+                            if (enteredValue.isNotBlank()) "$key: $enteredValue" else key
+                        } else "…"
+                        val startX = 100f
+                        val y = 250f
+                        val gap = 300f
+                        mutableStateListOf(
+                            Node(
+                                id = "n_app",
+                                position = Offset(startX + 0 * gap, y),
+                                title = "App: $pkg",
+                                color = Color(0xFFF9A825),
+                                inputs = emptyList(),
+                                outputs = listOf(Port("out", "n_app", PortType.OUTPUT)),
+                                body = "…"
+                            ),
+                            Node(
+                                id = "n_screen",
+                                position = Offset(startX + 1 * gap, y),
+                                title = "Screen: $screenTitle",
+                                color = Color(0xFFD6C6E1),
+                                inputs = listOf(Port("in", "n_screen", PortType.INPUT)),
+                                outputs = listOf(Port("out", "n_screen", PortType.OUTPUT)),
+                                body = activity.substringAfterLast('.')
+                            ),
+                            Node(
+                                id = "n_op",
+                                position = Offset(startX + 2 * gap, y),
+                                title = "Op: $op",
+                                color = Color(0xFFC5CAE9),
+                                inputs = listOf(Port("in", "n_op", PortType.INPUT)),
+                                outputs = listOf(Port("out", "n_op", PortType.OUTPUT)),
+                                body = opBody
+                            ),
+                            Node(
+                                id = "n_hint",
+                                position = Offset(startX + 3 * gap, y),
+                                title = "Hint: $hint",
+                                color = Color(0xFFC8E6C9),
+                                inputs = listOf(Port("in", "n_hint", PortType.INPUT)),
+                                outputs = listOf(Port("out", "n_hint", PortType.OUTPUT)),
+                                body = "…"
+                            ),
+                            Node(
+                                id = "n_sel",
+                                position = Offset(startX + 4 * gap, y),
+                                title = "Selector ($selectorCount)",
+                                color = Color(0xFFFFF3E0),
+                                inputs = listOf(Port("in", "n_sel", PortType.INPUT)),
+                                outputs = emptyList(),
+                                body = "stored"
                             )
-                        }
-                    },
-                    onNewConnection = { newConn ->
-                        if (connections.none {
-                                it.fromNodeId == newConn.fromNodeId &&
-                                        it.fromPortId == newConn.fromPortId &&
-                                        it.toNodeId == newConn.toNodeId &&
-                                        it.toPortId == newConn.toPortId
-                            }) {
-                            connections.add(newConn)
-                        }
-                    },
-                    onAutoArrange = {
+                        )
+                    }
+                    val connections =
+                        remember(nodes) { mutableStateListOf<Connection>().also { it.addAll(autoConnect(nodes)) } }
+                    val keyForGraph = selected.let { "${it.appPkg}|${it.activity}|${it.op}|${it.hint}" }
+                    LaunchedEffect(selected) {
                         autoArrangeNodes(
                             nodes, connections,
                             startX = 140f,
@@ -1035,13 +1050,46 @@ private fun MemoryBrowserView(
                             rowGap = 240f,
                             diagStep = 150f
                         )
-                    },
-                    graphKey = keyForGraph
-                )
+                    }
+                    NodeGraphEditor(
+                        nodes = nodes,
+                        connections = connections,
+                        onNodePositionChange = { id, drag ->
+                            val i = nodes.indexOfFirst { it.id == id }
+                            if (i != -1) {
+                                val p = nodes[i].position + drag
+                                nodes[i] =
+                                    nodes[i].copy(position = Offset(p.x.coerceAtLeast(-100f), p.y.coerceAtLeast(-100f)))
+                            }
+                        },
+                        onNewConnection = { newConn ->
+                            if (connections.none {
+                                    it.fromNodeId == newConn.fromNodeId &&
+                                            it.fromPortId == newConn.fromPortId &&
+                                            it.toNodeId == newConn.toNodeId &&
+                                            it.toPortId == newConn.toPortId
+                                }) connections.add(newConn)
+                        },
+                        onAutoArrange = {
+                            autoArrangeNodes(
+                                nodes, connections,
+                                startX = 140f,
+                                startY = 160f,
+                                colGap = 460f,
+                                rowGap = 240f,
+                                diagStep = 150f
+                            )
+                        },
+                        graphKey = keyForGraph
+                    )
+                }
             }
         }
     }
 }
+
+
+
 
 /* ---------------- Small composables (unchanged pieces you had) ---------------- */
 
@@ -1369,6 +1417,7 @@ fun AgentComponent(
                             onLog("memory:after-run entries=${compMem.stats().entries} selectors=${compMem.stats().selectors}")
                             onStatus("Done: ${result.count { it.success }}/${result.size} steps OK")
                         } catch (e: Exception) {
+                            model.plan.PlanRecorder.recordFailure(plan!!)
                             if (stopRequested) {
                                 onStatus("⏹️ Stopped by user")
                                 onLog("⏹️ Stopped by user")

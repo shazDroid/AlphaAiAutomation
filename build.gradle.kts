@@ -26,6 +26,7 @@ dependencies {
     implementation("org.yaml:snakeyaml:2.2")
     implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.0")
     implementation("com.fasterxml.jackson.dataformat:jackson-dataformat-yaml:2.17.0")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.17.+")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.github.ismai117:kottie:1.9.6")
 

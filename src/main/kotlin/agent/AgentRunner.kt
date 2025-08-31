@@ -12,11 +12,14 @@ import agent.vision.ScreenVision
 import agent.vision.VisionResult
 import io.appium.java_client.AppiumBy
 import io.appium.java_client.android.AndroidDriver
+import model.plan.PlanStatus
+import model.plan.toPlanAuto
 import org.openqa.selenium.By
 import org.openqa.selenium.JavascriptExecutor
 import org.openqa.selenium.OutputType
 import org.openqa.selenium.WebElement
 import org.openqa.selenium.remote.RemoteWebElement
+import java.time.Instant
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -798,6 +801,8 @@ class AgentRunner(
             captureAndAdvance()
         }
 
+        model.plan.PlanRegistry.plans.add(plan.toPlanAuto(PlanStatus.SUCCESS, Instant.now()))
+        model.plan.PlanRecorder.recordSuccess(plan)
         onLog("Plan completed. Success ${out.count { it.success }}/${out.size}")
         // <-- important: persist run stats/snapshot
         runCatching { flowRecorder?.commitRun() }
