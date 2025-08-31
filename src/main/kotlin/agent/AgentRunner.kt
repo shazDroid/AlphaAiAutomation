@@ -7,6 +7,7 @@ import agent.candidates.extractCandidatesForHint
 import agent.llm.LlmDisambiguator
 import agent.llm.MultiAgentSelector
 import agent.semantic.SemanticReranker
+import agent.util.isGenericSelector
 import agent.vision.DekiYoloClient
 import agent.vision.ScreenVision
 import agent.vision.VisionResult
@@ -27,6 +28,11 @@ interface SelectorMemory {
     fun find(appPkg: String, activity: String?, op: StepType, hint: String?): List<Locator>
     fun success(appPkg: String, activity: String?, op: StepType, hint: String?, locator: Locator)
     fun failure(appPkg: String, activity: String?, op: StepType, hint: String?, prior: Locator)
+    fun delete(appPkg: String? = null, activity: String? = null, op: StepType? = null, hint: String? = null): Int {
+        return 0
+    }
+
+    fun clearAll(): Int = delete()
 }
 /* =================================================================== */
 
@@ -38,7 +44,8 @@ class AgentRunner(
     private val semanticReranker: SemanticReranker? = null,
     private val selector: MultiAgentSelector? = null,
     private val deki: DekiYoloClient? = null,
-    private val memory: SelectorMemory? = null,        // memory adapter
+    private val memory: SelectorMemory? = null,         // memory adapter
+    private val memoryEvent: (String) -> Unit = {}      // UI-agnostic feedback hook
 ) {
     private val DEFAULT_WAIT_TEXT_TIMEOUT_MS = 45_000L
     private val DEFAULT_TAP_TIMEOUT_MS = 20_000L
@@ -120,14 +127,9 @@ class AgentRunner(
                 val snap = store.capture(step.index, step.type, step.targetHint, chosen, ok, notes)
                 val hintKey = step.targetHint ?: step.value ?: step.type.name
                 val flowBody = when (step.type) {
-                    StepType.INPUT_TEXT ->
-                        "${(step.targetHint ?: "value")}: ${step.value.orEmpty()}"
-
-                    StepType.CHECK ->
-                        "${step.targetHint ?: ""}: ${step.value ?: ""}".trim()
-
-                    else ->
-                        (step.targetHint ?: step.value ?: "")
+                    StepType.INPUT_TEXT -> "${(step.targetHint ?: "value")}: ${step.value.orEmpty()}"
+                    StepType.CHECK -> "${step.targetHint ?: ""}: ${step.value ?: ""}".trim()
+                    else -> (step.targetHint ?: step.value ?: "")
                 }
                 flowRecorder?.addStep(step.type, hintKey, flowBody.ifBlank { null })
 
@@ -176,11 +178,8 @@ class AgentRunner(
                         var memoryAdvanced = false
 
                         val saved = findSavedSelectors(StepType.INPUT_TEXT, th, onLog)
-                        if (saved.isNotEmpty()) {
-                            onLog("memory[input]: ${saved.size} selector(s) found for '$th' (act=${currentActivitySafe()})")
-                        } else {
-                            onLog("memory[input]: none for '$th' (act=${currentActivitySafe()})")
-                        }
+                        if (saved.isNotEmpty()) onLog("memory[input]: ${saved.size} selector(s) found for '$th' (act=${currentActivitySafe()})")
+                        else onLog("memory[input]: none for '$th' (act=${currentActivitySafe()})")
 
                         fun pv(s: String) = if (s.length <= 100) s else s.take(100) + "…"
 
@@ -227,7 +226,6 @@ class AgentRunner(
                         handleDialogWithPolling(step.index, onLog, onStatus, DIALOG_WINDOW_AFTER_STEP_MS)
                         agent.ui.Gestures.hideKeyboardIfOpen(driver, onLog)
                         onLog("memory[save]: op=INPUT_TEXT hint='${th}' → ${chosen.strategy}:${chosen.value.take(140)}")
-                        // Heal memory (store working selector, mark prior bad)
                         recordMemorySuccess(StepType.INPUT_TEXT, th, chosen!!, triedMemory, onLog)
                     }
 
@@ -251,11 +249,8 @@ class AgentRunner(
                         var memoryAdvanced: Boolean
 
                         val savedTap = findSavedSelectors(StepType.TAP, th, onLog)
-                        if (savedTap.isNotEmpty()) {
-                            onLog("memory[tap]: ${savedTap.size} selector(s) for '$th' (act=${currentActivitySafe()})")
-                        } else {
-                            onLog("memory[tap]: none for '$th' (act=${currentActivitySafe()})")
-                        }
+                        if (savedTap.isNotEmpty()) onLog("memory[tap]: ${savedTap.size} selector(s) for '$th' (act=${currentActivitySafe()})")
+                        else onLog("memory[tap]: none for '$th' (act=${currentActivitySafe()})")
 
                         fun pv(s: String) = if (s.length <= 100) s else s.take(100) + "…"
 
@@ -289,7 +284,7 @@ class AgentRunner(
                         // Only scroll now if memory didn't work
                         ensureVisibleByAutoScrollBounded(th, preferredSection, step.index, step.type, 6, onLog)
 
-                        // ======== Full robust TAP pipeline ========
+                        // ---------- helpers local to this TAP ----------
                         fun tokens(label: String): List<String> =
                             label.lowercase()
                                 .replace("&", " ")
@@ -313,7 +308,6 @@ class AgentRunner(
                             if (txt.isNotEmpty()) return "//*[normalize-space(@text)=${xpathLiteral(txt)}]"
                             return "(.//*[@clickable='true'])[1]"
                         }
-
 
                         fun firstClickableByTokens(label: String): Pair<Locator, WebElement>? {
                             val toks = tokens(label)
@@ -340,6 +334,7 @@ class AgentRunner(
                             return null
                         }
 
+                        // text-first attempt (fast)
                         val tokTap = run {
                             val hit = firstClickableByTokens(th)
                             if (hit == null) false else {
@@ -350,14 +345,29 @@ class AgentRunner(
                                 lastTapY = runCatching { hit.second.rect.let { it.y + it.height / 2 } }.getOrNull()
                                 val dialogHandled = runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }.getOrDefault(false)
                                 val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
-                                if (uiChanged) {
-                                    val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                                    val hintKey = step.targetHint ?: step.value ?: step.type.name
-                                    flowRecorder?.addStep(step.type, hintKey, (step.targetHint ?: step.value ?: ""))
-                                    out += snap; onStep(snap); pc += 1
-                                    recordMemorySuccess(StepType.TAP, th, chosen, triedMemory, onLog)
-                                    true
-                                } else false
+                                if (!uiChanged) false else {
+                                    // next-step plausibility
+                                    val next = steps.getOrNull(pc + 1)
+                                    val q = next?.targetHint ?: next?.value
+                                    val okNext = if (q.isNullOrBlank()) true
+                                    else runCatching {
+                                        resolver.isPresentQuick(
+                                            q,
+                                            timeoutMs = 900
+                                        ) { } != null
+                                    }.getOrDefault(false)
+                                    if (!okNext) {
+                                        runCatching { driver.navigate().back() }; false
+                                    } else {
+                                        val snap =
+                                            store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                        val hintKey = step.targetHint ?: step.value ?: step.type.name
+                                        flowRecorder?.addStep(step.type, hintKey, (step.targetHint ?: step.value ?: ""))
+                                        out += snap; onStep(snap); pc += 1
+                                        recordMemorySuccess(StepType.TAP, th, chosen!!, triedMemory, onLog)
+                                        true
+                                    }
+                                }
                             }
                         }
                         if (tokTap) continue
@@ -376,6 +386,7 @@ class AgentRunner(
                             }
                         }
 
+                        // === Fast checkable/switch ===
                         run {
                             val fast = resolver.findSwitchOrCheckableForLabel(th, effectiveSection)
                             if (fast != null) {
@@ -395,13 +406,14 @@ class AgentRunner(
                                         val hintKey = step.targetHint ?: step.value ?: step.type.name
                                         flowRecorder?.addStep(step.type, hintKey, (step.targetHint ?: step.value ?: ""))
                                         out += snap; onStep(snap); pc += 1
-                                        recordMemorySuccess(StepType.TAP, th, chosen, triedMemory, onLog)
+                                        recordMemorySuccess(StepType.TAP, th, chosen!!, triedMemory, onLog)
                                         return@run
                                     }
                                 }
                             }
                         }
 
+                        // === Vision path ===
                         val handledByVision: Boolean = run {
                             var vres = analyzeWithVisionFast("tap.pre", onLog, effectiveSection)
                             val labelFound = vres?.elements?.any { it.text?.contains(th, ignoreCase = true) == true } == true
@@ -419,19 +431,33 @@ class AgentRunner(
                             setScope(determineScopeByY(lastTapY, vres) ?: activeScope)
                             val dialogHandled = runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }.getOrDefault(false)
                             val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
-                            if (uiChanged) {
-                                val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
-                                val hintKey = step.targetHint ?: step.value ?: step.type.name
-                                flowRecorder?.addStep(step.type, hintKey, (step.targetHint ?: step.value ?: ""))
-
-                                out += snap; onStep(snap); pc += 1; true
-                            } else false
+                            if (!uiChanged) false else {
+                                // next-step plausibility
+                                val next = steps.getOrNull(pc + 1)
+                                val q = next?.targetHint ?: next?.value
+                                val okNext = if (q.isNullOrBlank()) true
+                                else runCatching {
+                                    resolver.isPresentQuick(
+                                        q,
+                                        timeoutMs = 900
+                                    ) { } != null
+                                }.getOrDefault(false)
+                                if (!okNext) {
+                                    runCatching { driver.navigate().back() }; false
+                                } else {
+                                    val snap = store.capture(step.index, step.type, step.targetHint, chosen, true, null)
+                                    val hintKey = step.targetHint ?: step.value ?: step.type.name
+                                    flowRecorder?.addStep(step.type, hintKey, (step.targetHint ?: step.value ?: ""))
+                                    out += snap; onStep(snap); pc += 1; true
+                                }
+                            }
                         }
                         if (handledByVision) {
                             recordMemorySuccess(StepType.TAP, th, chosen!!, triedMemory, onLog)
                             continue
                         }
 
+                        // === Toggle by DOM ===
                         val toggleHit = tryToggleByLabel(th, preferredSection, desiredToggle, onLog)
                         if (toggleHit.first) {
                             chosen = toggleHit.second
@@ -445,6 +471,7 @@ class AgentRunner(
                             continue
                         }
 
+                        // === Full candidate scan loop ===
                         val deadline = System.currentTimeMillis() + timeout
                         var changed = false
                         var tappedLocator: Locator? = null
@@ -465,10 +492,16 @@ class AgentRunner(
                             val all = if (effectiveSection != null) applySectionScopeXY(all0, effectiveSection, vres) else all0
 
                             fun norm(s: String?) = normalize(s)
-                            val exact = all.filter { norm(it.label) == norm(th) }.toMutableList()
                             val ordered = mutableListOf<UICandidate>()
+
+                            // 0) text-first ranker (fast, general)
+                            ordered += rankByXmlText(th, all).take(6)
+
+                            // 1) exact label tie-breaker
+                            val exact = all.filter { norm(it.label) == norm(th) }
                             if (exact.isNotEmpty()) ordered += preferByRolePosAndHeader(exact, effectiveSection, vres)
 
+                            // 2) LLM/selector
                             if (ordered.isEmpty()) {
                                 val visionHint = vres?.let { buildVisionHint(it, effectiveSection) } ?: "-"
                                 val instructionForSelector = buildString {
@@ -480,11 +513,13 @@ class AgentRunner(
                                 pick.candidateId?.let { cid -> all.firstOrNull { it.id == cid }?.let { ordered += it } }
                             }
 
+                            // 3) semantic
                             if (ordered.isEmpty() && semanticReranker != null) {
                                 val semTop = runCatching { semanticReranker?.rerank(th, all)?.take(10) }.getOrDefault(emptyList())
                                 if (!semTop.isNullOrEmpty()) ordered += semTop
                             }
 
+                            // 4) near equals / fallback
                             if (ordered.isEmpty()) {
                                 val near = all.filter { nearEquals(th, it.label) }
                                 if (near.isNotEmpty()) ordered += preferByRolePosAndHeader(near, effectiveSection, vres)
@@ -504,7 +539,23 @@ class AgentRunner(
                                 tappedLocator = validated?.toLocatorWith(loc) ?: loc
                                 val dialogHandled = runCatching { handleDialogWithPolling(step.index, onLog, onStatus, 1600L) }.getOrDefault(false)
                                 val uiChanged = dialogHandled || waitUiChangedSince(before, 1800L)
-                                return uiChanged
+                                if (!uiChanged) return false
+
+                                // next-step plausibility quick check
+                                val next = steps.getOrNull(pc + 1)
+                                val q = next?.targetHint ?: next?.value
+                                val okNext = if (q.isNullOrBlank()) true
+                                else runCatching {
+                                    resolver.isPresentQuick(
+                                        q,
+                                        timeoutMs = 900
+                                    ) { } != null
+                                }.getOrDefault(false)
+                                if (!okNext) {
+                                    runCatching { driver.navigate().back() }
+                                    return false
+                                }
+                                return true
                             }
 
                             for (cand in ordered.distinctBy { it.id }) {
@@ -514,19 +565,11 @@ class AgentRunner(
                         }
 
                         if (!changed) {
-                            val beforeXml = runCatching { driver.pageSource }.getOrNull()
                             val beforeHash = safePageSourceHash()
                             onStatus("""ACTION_REQUIRED::Tap "$th" on the device""")
                             onLog("  waiting up to 12s for manual tap…")
                             val manual = waitUiChangedSince(beforeHash, 12_000L)
                             if (!manual) throw IllegalStateException("Tap timeout: \"$th\"${lastScanError?.let { " ($it)" } ?: ""}")
-                            val afterXml = runCatching { driver.pageSource }.getOrNull()
-
-                            val post = resolver.findSwitchOrCheckableForLabel(th, effectiveSection)
-                                ?: resolver.resolveChangedCheckableByDiff(beforeXml, afterXml, th, effectiveSection)
-                                ?: resolver.findRightSideClickableForLabel(th, effectiveSection)
-
-                            tappedLocator = post ?: tappedLocator
                         }
 
                         chosen = tappedLocator ?: resolver.findSwitchOrCheckableForLabel(th, effectiveSection)
@@ -564,11 +607,8 @@ class AgentRunner(
                         var memoryAdvanced = false
 
                         val savedCheck = findSavedSelectors(StepType.CHECK, th, onLog)
-                        if (savedCheck.isNotEmpty()) {
-                            onLog("memory[check]: ${savedCheck.size} selector(s) for '$th' (act=${currentActivitySafe()})")
-                        } else {
-                            onLog("memory[check]: none for '$th' (act=${currentActivitySafe()})")
-                        }
+                        if (savedCheck.isNotEmpty()) onLog("memory[check]: ${savedCheck.size} selector(s) for '$th' (act=${currentActivitySafe()})")
+                        else onLog("memory[check]: none for '$th' (act=${currentActivitySafe()})")
 
                         fun pv(s: String) = if (s.length <= 100) s else s.take(100) + "…"
 
@@ -802,9 +842,51 @@ class AgentRunner(
         model.plan.PlanRecorder.recordSuccess(plan, runDir = runDir)
 
         onLog("Plan completed. Success ${out.count { it.success }}/${out.size}")
-        // <-- important: persist run stats/snapshot
         runCatching { flowRecorder?.commitRun() }
         return out
+    }
+
+    /* ===================== Text-first DOM ranker ===================== */
+
+    private data class Ranked(val cand: UICandidate, val score: Int)
+
+    private fun normTokens(s: String?): List<String> =
+        (s ?: "").lowercase().split(Regex("\\W+")).filter { it.length >= 2 }
+
+    private fun scoreByText(hint: String, label: String): Int {
+        val H = hint.trim().lowercase()
+        val L = label.trim().lowercase()
+        if (L == H) return 100
+        if (L.contains(H)) return 85
+        val ht = normTokens(H).toSet()
+        val lt = normTokens(L).toSet()
+        val inter = ht.intersect(lt).size
+        return when {
+            inter == ht.size && ht.isNotEmpty() -> 75
+            inter > 0 -> 45 + inter * 5
+            else -> 0
+        }
+    }
+
+    private fun labelForXpath(xp: String): String {
+        return runCatching {
+            val el = driver.findElements(AppiumBy.xpath(xp)).firstOrNull() ?: return ""
+            val t = (runCatching { el.text }.getOrNull() ?: "").trim()
+            val d = el.getAttribute("content-desc")?.trim().orEmpty()
+            val rid = el.getAttribute("resource-id")?.substringAfterLast('/')?.trim().orEmpty()
+            listOf(t, d, rid).firstOrNull { it.isNotBlank() } ?: ""
+        }.getOrDefault("")
+    }
+
+    /** Rank candidates by (text/content-desc/resource-id tail) similarity to hint. */
+    private fun rankByXmlText(hint: String, all: List<UICandidate>): List<UICandidate> {
+        if (all.isEmpty()) return all
+        val ranked = all.map { c ->
+            val lbl = c.label?.takeIf { it.isNotBlank() } ?: labelForXpath(c.xpath)
+            Ranked(c, scoreByText(hint, lbl))
+        }.filter { it.score >= 40 }
+            .sortedByDescending { it.score }
+        return ranked.map { it.cand }
     }
 
     /* ========================== Memory helpers =========================== */
@@ -815,7 +897,6 @@ class AgentRunner(
             var el: WebElement? = runCatching { driver.findElement(by) }.getOrNull()
             if (el == null) return false
 
-            // if off-screen, auto-scroll a bit to surface it
             var i = 0
             while (el != null && !el!!.isFullyVisible(driver) && i++ < 6) {
                 agent.ui.Gestures.standardScrollUp(driver)
@@ -824,7 +905,6 @@ class AgentRunner(
             }
             el ?: return false
 
-            // click ancestor if needed
             val clickEl = if (runCatching { el!!.getAttribute("clickable") }.getOrNull() == "true")
                 el!! else el!!.findElements(By.xpath("ancestor::*[@clickable='true'][1]")).firstOrNull() ?: el!!
 
@@ -995,8 +1075,6 @@ class AgentRunner(
         val idB = (b as? RemoteWebElement)?.id
         if (!idA.isNullOrBlank() && !idB.isNullOrBlank()) return idA == idB
         val rA = (runCatching { a.getAttribute("resource-id") }.getOrNull() ?: "")
-        the@{
-        }
         val rB = (runCatching { b.getAttribute("resource-id") }.getOrNull() ?: "")
         val cA = (runCatching { a.getAttribute("className") }.getOrNull() ?: "")
         val cB = (runCatching { b.getAttribute("className") }.getOrNull() ?: "")
@@ -1545,7 +1623,7 @@ class AgentRunner(
         if (swipes > 0) {
             onLog("auto-scroll ×$swipes before $stepType \"$label\"")
             store.capture(stepIndex, StepType.SCROLL_TO, label, null, true, "auto=1;before=$stepType;count=$swipes")
-            flowRecorder?.addStep(StepType.SCROLL_TO, label) // old overload kept
+            flowRecorder?.addStep(StepType.SCROLL_TO, label)
         }
         return swipes
     }
@@ -1588,7 +1666,12 @@ class AgentRunner(
         val h = normHint(hint)
         onLog("memory[find]: pkg=$pkg act=$act aliases=${acts.joinToString()} op=${op.name} hint='${h}'")
         for (a in acts) runCatching { mem.find(pkg, a, op, h) }.onSuccess { if (it.isNotEmpty()) hits += it }
-        return hits.distinctBy { it.strategy to it.value }
+
+        val filtered = hits
+            .distinctBy { it.strategy to it.value }
+            .filterNot { loc -> isGenericSelector(loc.strategy.name, loc.value) }
+        if (hits.size != filtered.size) onLog("memory[find]: filtered ${hits.size - filtered.size} generic selector(s)")
+        return filtered
     }
 
     private fun recordMemorySuccess(
@@ -1603,15 +1686,27 @@ class AgentRunner(
             val pkg = pkgSafe()
             val act = currentActivitySafe()
             val h = normHint(hint)
+
+            // Drop generics (global)
+            if (isGenericSelector(chosen.strategy.name, chosen.value)) {
+                onLog("memory[skip-save]: selector too generic → ${chosen.strategy}:${chosen.value}")
+                memoryEvent("Skipped generic selector for \"${h ?: op.name}\"")
+                return@runCatching
+            }
+
             onLog("memory[save]: op=$op hint='${h ?: ""}' → ${chosen.strategy}:${chosen.value.take(100)}")
-            // helpful audit of the exact key shape your adapter will use:
             onLog("memory[key]: ${pkg}||${act}||${op.name}||${h ?: ""}")
             mem.success(pkg, act, op, h, chosen)
+            memoryEvent("Memory saved: ${op.name} • \"${h ?: ""}\"")
+
             if (tried != null && (tried.strategy != chosen.strategy || tried.value != chosen.value)) {
-                onLog("memory[mark-bad]: op=$op hint='${h ?: ""}' prior=${tried.strategy}:${tried.value.take(100)}")
-                mem.failure(pkg, act, op, h, tried)
+                if (!isGenericSelector(tried.strategy.name, tried.value)) {
+                    onLog("memory[mark-bad]: op=$op hint='${h ?: ""}' prior=${tried.strategy}:${tried.value.take(100)}")
+                    mem.failure(pkg, act, op, h, tried)
+                } else {
+                    onLog("memory[mark-bad]: skipped generic prior")
+                }
             }
         }
     }
-
 }

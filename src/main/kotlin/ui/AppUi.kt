@@ -584,7 +584,11 @@ fun AppUI() {
                         MemoryBrowserView(
                             index = memIndex,
                             selected = selectedEntry,
-                            onSelect = { selectedEntry = it }
+                            onSelect = { selectedEntry = it },
+                            onMemoryReload = { memIndex = loadSelectorMemoryIndex(File("memory")) },
+                            onMemoryChanged = {
+                                memIndex = loadSelectorMemoryIndex(File("memory"))
+                            }
                         )
                     }
 
@@ -761,6 +765,13 @@ fun AppUI() {
                                         outDir = genState.outDir
                                     )
                                 }
+
+                                Spacer(Modifier.height(8.dp))
+
+                                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Center) {
+                                    MemoryTicker(Modifier.padding(vertical = 10.dp))
+                                }
+
                             }
                         }
 
@@ -822,7 +833,9 @@ fun AppUI() {
 private fun MemoryBrowserView(
     index: MemIndex,
     selected: MemEntry?,
-    onSelect: (MemEntry) -> Unit
+    onSelect: (MemEntry) -> Unit,
+    onMemoryReload: () -> Unit,
+    onMemoryChanged: (() -> Unit)? = null
 ) {
     var tab by remember { mutableStateOf(0) }
     val memoryTabList = listOf("Tree", "All", "Plans")
@@ -910,7 +923,8 @@ private fun MemoryBrowserView(
                             plans = plans,
                             selectedId = selectedPlanId,
                             onSelect = { selectedPlanId = it.id.value },
-                            modifier = Modifier.fillMaxSize()
+                            modifier = Modifier.fillMaxSize(),
+                            onMemoryChanged = onMemoryChanged
                         )
                     }
                 }
@@ -1418,7 +1432,8 @@ fun AgentComponent(
                                 llmDisambiguator = gemini,
                                 semanticReranker = reranker,
                                 deki = dekiClient,
-                                memory = selectorMem
+                                memory = selectorMem,
+                                memoryEvent = { msg -> ui.component.MemoryBus.saved(msg) }
                             ).run(
                                 plan = p,
                                 onStep = { snap ->
