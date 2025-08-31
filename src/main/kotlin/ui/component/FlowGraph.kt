@@ -143,7 +143,8 @@ fun NodeGraphEditor(
     onNewConnection: (Connection) -> Unit,
     modifier: Modifier = Modifier,
     onAutoArrange: (() -> Unit)? = null,
-    graphKey: Any? = null                      // <— tell the editor when the graph “changes”
+    graphKey: Any? = null,
+    screenshotPathForNodeId: ((String) -> String?)? = null
 ) {
     // ——— camera & transient state (reset per graphKey) ———
     var canvasOffset by remember(graphKey) { mutableStateOf(Offset.Zero) }
@@ -287,7 +288,8 @@ fun NodeGraphEditor(
                     }
                     connectionDragState = null
                 },
-                graphKey = graphKey
+                graphKey = graphKey,
+                screenshotPathForNodeId = screenshotPathForNodeId
             )
         }
 
@@ -322,7 +324,8 @@ private fun GraphNode(
     onConnectionDragStart: (Port) -> Unit,
     onConnectionDrag: (Offset) -> Unit,
     onConnectionDragEnd: () -> Unit,
-    graphKey: Any? = null
+    graphKey: Any? = null,
+    screenshotPathForNodeId: ((String) -> String?)? = null
 ) {
     Box(
         modifier = Modifier
@@ -376,14 +379,25 @@ private fun GraphNode(
                     }
                 }
 
-                Box(Modifier.weight(3f).height((48 * scale).dp)) {
+                Column(
+                    modifier = Modifier
+                        .weight(3f)
+                        .wrapContentHeight()
+                        .heightIn(min = (48 * scale).dp),
+                    verticalArrangement = Arrangement.spacedBy((6 * scale).dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
                     Text(
                         node.body,
                         color = Color.Gray,
-                        modifier = Modifier.align(Alignment.Center),
                         fontSize = (14 * scale).sp
                     )
+                    val thumbPath = screenshotPathForNodeId?.invoke(node.id)
+                    if (!thumbPath.isNullOrBlank()) {
+                        NodeThumbnail(thumbPath)
+                    }
                 }
+
 
                 Column(
                     modifier = Modifier.weight(1f),

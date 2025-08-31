@@ -921,11 +921,12 @@ private fun MemoryBrowserView(
         RightCard(modifier = Modifier.weight(0.52f).height(680.dp), pad = 6.dp) {
             if (tab == 2 && selectedPlan != null) {
                 BoxWithConstraints(Modifier.fillMaxSize()) {
-                    val nodes = remember(selectedPlan) { planToNodes(selectedPlan).toMutableStateList() }
-                    val connections = remember(nodes) { planToConnections(nodes).toMutableStateList() }
+                    val nodes = remember(selectedPlan) { ui.component.planToNodes(selectedPlan).toMutableStateList() }
+                    val connections = remember(nodes) { ui.component.planToConnections(nodes).toMutableStateList() }
+                    val screenshotMap = remember(selectedPlan) { ui.component.planScreenshotMap(selectedPlan) }
 
                     LaunchedEffect(selectedPlan, maxWidth) {
-                        gridArrangeToFit(
+                        ui.component.gridArrangeToFit(
                             nodes = nodes,
                             maxWidthDp = maxWidth.value,
                             startX = 140f,
@@ -942,20 +943,22 @@ private fun MemoryBrowserView(
                             val i = nodes.indexOfFirst { it.id == id }
                             if (i != -1) {
                                 val p = nodes[i].position + drag
-                                nodes[i] =
-                                    nodes[i].copy(position = Offset(p.x.coerceAtLeast(-100f), p.y.coerceAtLeast(-100f)))
+                                nodes[i] = nodes[i].copy(
+                                    position = androidx.compose.ui.geometry.Offset(
+                                        p.x.coerceAtLeast(-100f),
+                                        p.y.coerceAtLeast(-100f)
+                                    )
+                                )
                             }
                         },
                         onNewConnection = { newConn ->
                             if (connections.none {
-                                    it.fromNodeId == newConn.fromNodeId &&
-                                            it.fromPortId == newConn.fromPortId &&
-                                            it.toNodeId == newConn.toNodeId &&
-                                            it.toPortId == newConn.toPortId
+                                    it.fromNodeId == newConn.fromNodeId && it.fromPortId == newConn.fromPortId &&
+                                            it.toNodeId == newConn.toNodeId && it.toPortId == newConn.toPortId
                                 }) connections.add(newConn)
                         },
                         onAutoArrange = {
-                            gridArrangeToFit(
+                            ui.component.gridArrangeToFit(
                                 nodes = nodes,
                                 maxWidthDp = maxWidth.value,
                                 startX = 140f,
@@ -964,7 +967,8 @@ private fun MemoryBrowserView(
                                 rowGap = 240f
                             )
                         },
-                        graphKey = "plan_${selectedPlan.id.value}"
+                        graphKey = "plan_${selectedPlan.id.value}",
+                        screenshotPathForNodeId = { id -> screenshotMap[id] }
                     )
                 }
             } else {

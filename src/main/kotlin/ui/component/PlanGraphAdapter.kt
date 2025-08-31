@@ -3,13 +3,16 @@ package ui.component
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import model.plan.Plan
-import model.plan.PlanStep
+import model.plan.PlanRunIndex
+import model.plan.collectStepScreensFromRun
+import model.plan.runsRoot
+import java.io.File
 
 fun planToNodes(plan: Plan): List<Node> {
     val startX = 100f
     val y = 200f
     val gap = 300f
-    return plan.steps.mapIndexed { idx, step: PlanStep ->
+    return plan.steps.mapIndexed { idx, step ->
         val nodeId = "plan_${plan.id.value}_${step.index}"
         Node(
             id = nodeId,
@@ -30,6 +33,18 @@ fun planToNodes(plan: Plan): List<Node> {
 }
 
 fun planToConnections(nodes: List<Node>): List<Connection> =
-    nodes.zipWithNext().map { (a, b) ->
-        Connection(fromNodeId = a.id, fromPortId = "out", toNodeId = b.id, toPortId = "in")
-    }
+    nodes.zipWithNext().map { (a, b) -> Connection(a.id, "out", b.id, "in") }
+
+fun planScreenshotMap(plan: Plan): Map<String, String> {
+    val runId = PlanRunIndex.get(plan.id.value)
+    val indexToPath: Map<Int, String> = runId
+        ?.let { File(runsRoot(), it) }
+        ?.takeIf { it.exists() }
+        ?.let { collectStepScreensFromRun(it) }
+        ?: emptyMap()
+
+    return plan.steps.associate { st ->
+        val p = indexToPath[st.index] ?: st.screenshotPath.orEmpty()
+        "plan_${plan.id.value}_${st.index}" to if (p.isNotBlank() && File(p).exists()) p else ""
+    }.filterValues { it.isNotBlank() }
+}

@@ -6,6 +6,7 @@ import ui.AppUI
 
 fun main() = application {
     model.plan.PlanStore.loadIntoRegistry()
+    model.plan.PlanRunIndex.load()
     Window(onCloseRequest = ::exitApplication, title = "Alpha Ui Automation", state = WindowState(width = 1400.dp, height = 900.dp)) {
         AppUI()
     }
