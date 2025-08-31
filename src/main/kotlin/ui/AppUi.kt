@@ -840,7 +840,7 @@ private fun MemoryBrowserView(
 
     Row(Modifier.fillMaxWidth()) {
 
-        RightCard(modifier = Modifier.weight(0.24f).height(680.dp), pad = 10.dp) {
+        RightCard(modifier = Modifier.weight(0.24f).fillMaxHeight(), pad = 10.dp) {
             val flatItems = remember(index) { flattenMemIndex(index) }
 
             Column(Modifier.fillMaxSize()) {
@@ -919,7 +919,7 @@ private fun MemoryBrowserView(
 
         Spacer(Modifier.width(16.dp))
 
-        RightCard(modifier = Modifier.weight(0.52f).height(680.dp), pad = 6.dp) {
+        RightCard(modifier = Modifier.weight(0.52f).fillMaxHeight(), pad = 6.dp) {
             if (tab == 2 && selectedPlan != null) {
                 BoxWithConstraints(Modifier.fillMaxSize()) {
                     val nodes = remember(selectedPlan) { ui.component.planToNodes(selectedPlan).toMutableStateList() }
