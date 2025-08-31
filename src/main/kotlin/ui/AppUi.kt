@@ -834,6 +834,7 @@ private fun MemoryBrowserView(
     }
     val selectedPlan = plans.firstOrNull { it.id.value == selectedPlanId }
 
+
     Text("Store Memory", fontWeight = MaterialTheme.typography.h6.fontWeight)
     Spacer(Modifier.height(8.dp))
 
@@ -926,7 +927,7 @@ private fun MemoryBrowserView(
                     val screenshotMap = remember(selectedPlan) { ui.component.planScreenshotMap(selectedPlan) }
 
                     LaunchedEffect(selectedPlan, maxWidth) {
-                        ui.component.gridArrangeToFit(
+                        gridArrangeToFit(
                             nodes = nodes,
                             maxWidthDp = maxWidth.value,
                             startX = 140f,
@@ -935,6 +936,19 @@ private fun MemoryBrowserView(
                             rowGap = 240f
                         )
                     }
+
+                    LaunchedEffect(selectedPlan.id) {
+                        autoArrangeNodes(
+                            nodes = nodes,
+                            connections = connections,
+                            startX = 140f,
+                            startY = 120f,
+                            colGap = 420f,
+                            rowGap = 220f,
+                            diagStep = 150f
+                        )
+                    }
+
 
                     NodeGraphEditor(
                         nodes = nodes,

@@ -198,11 +198,14 @@ fun NodeGraphEditor(
                         val event = awaitPointerEvent()
                         if (event.type == PointerEventType.Scroll) {
                             val dy = event.changes.first().scrollDelta.y
-                            val newScale = (scale - dy * 0.1f).coerceIn(0.2f, 3f)
-                            val p = event.changes.first().position
-                            val ratio = newScale / scale
-                            canvasOffset = p * (1 - ratio) + canvasOffset * ratio
-                            scale = newScale
+                            val raw = (scale - dy * 0.08f).coerceIn(0.2f, 3f)
+                            val newScale = (raw * 100f).roundToInt() / 100f
+                            if (newScale != scale) {
+                                val p = event.changes.first().position
+                                val ratio = newScale / scale
+                                canvasOffset = p * (1 - ratio) + canvasOffset * ratio
+                                scale = newScale
+                            }
                             event.changes.first().consume()
                         }
                     }
@@ -360,6 +363,7 @@ private fun GraphNode(
                 )
             }
 
+            // 1) replace the Row(...) inside GraphNode with:
             Row(Modifier.fillMaxWidth().padding(vertical = (12 * scale).dp)) {
                 Column(
                     modifier = Modifier.weight(1f),
@@ -368,8 +372,7 @@ private fun GraphNode(
                 ) {
                     node.inputs.forEach { port ->
                         PortHandle(
-                            port,
-                            scale,
+                            port, scale,
                             onPortPositioned,
                             onConnectionDragStart,
                             onConnectionDrag,
@@ -380,24 +383,21 @@ private fun GraphNode(
                 }
 
                 Column(
-                    modifier = Modifier
-                        .weight(3f)
-                        .wrapContentHeight()
-                        .heightIn(min = (48 * scale).dp),
-                    verticalArrangement = Arrangement.spacedBy((6 * scale).dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+                    modifier = Modifier.weight(3f).padding(horizontal = (8 * scale).dp),
+                    verticalArrangement = Arrangement.spacedBy((8 * scale).dp)
                 ) {
-                    Text(
-                        node.body,
-                        color = Color.Gray,
-                        fontSize = (14 * scale).sp
-                    )
+                    if (node.body.isNotBlank()) {
+                        Text(
+                            node.body,
+                            color = Color.Gray,
+                            fontSize = (14 * scale).sp
+                        )
+                    }
                     val thumbPath = screenshotPathForNodeId?.invoke(node.id)
                     if (!thumbPath.isNullOrBlank()) {
                         NodeThumbnail(thumbPath)
                     }
                 }
-
 
                 Column(
                     modifier = Modifier.weight(1f),
@@ -406,8 +406,7 @@ private fun GraphNode(
                 ) {
                     node.outputs.forEach { port ->
                         PortHandle(
-                            port,
-                            scale,
+                            port, scale,
                             onPortPositioned,
                             onConnectionDragStart,
                             onConnectionDrag,
@@ -417,6 +416,7 @@ private fun GraphNode(
                     }
                 }
             }
+
         }
     }
 }
