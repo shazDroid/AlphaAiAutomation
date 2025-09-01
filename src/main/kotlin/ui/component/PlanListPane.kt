@@ -1,10 +1,14 @@
-// ui/component/PlanListPane.kt
 package ui.component
 
+import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.*
 import androidx.compose.material.icons.Icons
@@ -27,6 +31,9 @@ import java.io.File
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
+/**
+ * Scrollable plans list with desktop scrollbar and delete-memory actions.
+ */
 @Composable
 fun PlanListPane(
     plans: List<Plan>,
@@ -42,75 +49,86 @@ fun PlanListPane(
     val baseBg = MaterialTheme.colors.surface
     val selBg = Color(0xFFE8F0FF)
     val selBorder = Color(0xFF6C7CFF)
-
     var confirmFor by remember { mutableStateOf<Plan?>(null) }
+    val listState = rememberLazyListState()
 
-    Column(modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        plans.forEach { plan ->
-            val selected = (selectedId == plan.id.value)
-
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(shape)
-                    .background(if (selected) selBg else baseBg, shape)
-                    .border(
-                        width = if (selected) 2.dp else 1.dp,
-                        color = if (selected) selBorder else baseBorder,
-                        shape = shape
-                    )
-                    .clickable { onSelect(plan) }
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(
-                        text = planDisplayName(plan),
-                        style = MaterialTheme.typography.subtitle1.copy(fontWeight = FontWeight.SemiBold),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "${plan.steps.size} steps • ${planCreatedAtStr(plan, fmt)}",
-                        style = MaterialTheme.typography.caption,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                val statusColor = when (plan.status) {
-                    PlanStatus.SUCCESS -> Color(0xFF2E7D32)
-                    PlanStatus.PARTIAL -> Color(0xFFF9A825)
-                    PlanStatus.FAILED -> Color(0xFFC62828)
-                }
-
-                // Status pill (unchanged)
-                Box(
+    Box(modifier = modifier.padding(8.dp)) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(end = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            items(plans, key = { it.id.value }) { plan ->
+                val selected = (selectedId == plan.id.value)
+                Row(
                     Modifier
-                        .height(24.dp)
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(Color(0xFFF6F7FB))
-                        .border(1.dp, baseBorder, RoundedCornerShape(999.dp))
-                        .padding(horizontal = 10.dp),
-                    contentAlignment = Alignment.Center
+                        .fillMaxWidth()
+                        .clip(shape)
+                        .background(if (selected) selBg else baseBg, shape)
+                        .border(
+                            width = if (selected) 2.dp else 1.dp,
+                            color = if (selected) selBorder else baseBorder,
+                            shape = shape
+                        )
+                        .clickable { onSelect(plan) }
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(text = plan.status.name, color = statusColor, style = MaterialTheme.typography.caption)
-                }
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = planDisplayName(plan),
+                            style = MaterialTheme.typography.subtitle1.copy(fontWeight = FontWeight.SemiBold),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "${plan.steps.size} steps • ${planCreatedAtStr(plan, fmt)}",
+                            style = MaterialTheme.typography.caption,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
 
-                Spacer(Modifier.width(8.dp))
+                    val statusColor = when (plan.status) {
+                        PlanStatus.SUCCESS -> Color(0xFF2E7D32)
+                        PlanStatus.PARTIAL -> Color(0xFFF9A825)
+                        PlanStatus.FAILED -> Color(0xFFC62828)
+                    }
 
-                // Delete memory button (new)
-                IconButton(
-                    onClick = { confirmFor = plan },
-                    modifier = Modifier.size(36.dp)
-                ) {
-                    Icon(Icons.Default.Delete, contentDescription = "Delete memory", tint = Color(0xFFD32F2F))
+                    Box(
+                        Modifier
+                            .height(24.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(Color(0xFFF6F7FB))
+                            .border(1.dp, baseBorder, RoundedCornerShape(999.dp))
+                            .padding(horizontal = 10.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(text = plan.status.name, color = statusColor, style = MaterialTheme.typography.caption)
+                    }
+
+                    Spacer(Modifier.width(8.dp))
+
+                    IconButton(
+                        onClick = { confirmFor = plan },
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Icon(Icons.Default.Delete, contentDescription = "Delete memory", tint = Color(0xFFD32F2F))
+                    }
                 }
             }
         }
+
+        VerticalScrollbar(
+            adapter = rememberScrollbarAdapter(listState),
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .fillMaxHeight()
+        )
     }
 
-    // confirm dialog
     if (confirmFor != null) {
         val plan = confirmFor!!
         AlertDialog(
@@ -132,10 +150,7 @@ fun PlanListPane(
     }
 }
 
-/* ---------------- helpers to read Plan safely without changing model ---------------- */
-
 private fun planDisplayName(p: Plan): String {
-    // prefer title -> name -> id.value
     val t = runCatching { p.javaClass.getMethod("getTitle").invoke(p) as? String }.getOrNull()
         ?.takeIf { !it.isNullOrBlank() }
         ?: runCatching { p.javaClass.getMethod("getName").invoke(p) as? String }.getOrNull()
@@ -149,11 +164,9 @@ private fun planCreatedAtStr(p: Plan, fmt: DateTimeFormatter): String {
         is java.time.Instant -> any.atZone(ZoneId.systemDefault()).format(fmt)
         is java.time.LocalDateTime -> any.atZone(ZoneId.systemDefault()).format(fmt)
         is Long -> java.time.Instant.ofEpochMilli(any).atZone(ZoneId.systemDefault()).format(fmt)
-        else -> "" // fallback
+        else -> ""
     }
 }
-
-/* ---------------- deletion on disk ---------------- */
 
 private val mapper: ObjectMapper = ObjectMapper()
     .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
@@ -161,8 +174,6 @@ private val mapper: ObjectMapper = ObjectMapper()
 
 /**
  * Deletes selector memory lines that correspond to (op,hint) pairs used in the plan.
- * Works for both memory/components.json (or component.json) and legacy TSV layout.
- * Returns number of items removed.
  */
 fun deleteMemoryForPlanOnDisk(
     plan: Plan,
@@ -170,8 +181,6 @@ fun deleteMemoryForPlanOnDisk(
     appPkg: String? = null
 ): Int {
     var removed = 0
-
-    // collect unique (op,hint) pairs from the plan
     val pairs: Set<Pair<String, String>> = plan.steps.mapNotNull { s ->
         val op = runCatching { s.javaClass.getMethod("getType").invoke(s) }.getOrNull()?.toString()
         val hint = runCatching { s.javaClass.getMethod("getTargetHint").invoke(s) as? String }.getOrNull()
@@ -179,10 +188,8 @@ fun deleteMemoryForPlanOnDisk(
         val h = hint?.trim()?.lowercase()
         if (op.isNullOrBlank() || h.isNullOrBlank()) null else op to h
     }.toSet()
-
     if (pairs.isEmpty()) return 0
 
-    // JSON stores
     val jsonFiles = listOf("components.json", "component.json")
         .map { File(memoryDir, it) }
         .filter { it.isFile && it.length() > 0 }
@@ -205,7 +212,6 @@ fun deleteMemoryForPlanOnDisk(
         mapper.writerWithDefaultPrettyPrinter().writeValue(jf, root)
     }
 
-    // Legacy TSV: memory/<pkg>/<activity>/*.tsv
     if (memoryDir.isDirectory) {
         memoryDir.listFiles()?.filter { it.isDirectory }?.forEach { appDir ->
             if (appPkg != null && appDir.name != appPkg) return@forEach
@@ -226,6 +232,5 @@ fun deleteMemoryForPlanOnDisk(
             }
         }
     }
-
     return removed
 }
