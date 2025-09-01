@@ -13,8 +13,10 @@ import agent.runner.services.RankService
 import agent.runner.services.UiService
 import agent.runner.services.VisionService
 import agent.runner.services.XPathService
+import agent.runner.util.ScrollUtil
 import io.appium.java_client.AppiumBy
 import org.openqa.selenium.WebElement
+
 
 /**
  * Handles TAP steps.
@@ -52,6 +54,7 @@ class TapHandler(
 
         val tokenHit = firstClickableByTokens(th)
         if (tokenHit != null) {
+            ScrollUtil.ensureInView(ctx.driver, tokenHit.second)
             tokenHit.second.click()
             ctx.lastTapY = runCatching { tokenHit.second.rect.let { it.y + it.height / 2 } }.getOrNull()
             ctx.setScope(vision.determineScopeByY(ctx.lastTapY, vision.fast(effectiveSection)) ?: ctx.activeScope)
@@ -125,6 +128,7 @@ class TapHandler(
                 el = runCatching { ctx.driver.findElement(by) }.getOrNull() ?: return false
             }
             val clickEl = ui.firstClickable(el)
+            ScrollUtil.ensureInView(ctx.driver, clickEl)
             val before = ctx.pageHash()
             clickEl.click()
             ctx.lastTapY = runCatching { clickEl.rect.let { it.y + it.height / 2 } }.getOrNull()
@@ -140,6 +144,7 @@ class TapHandler(
         val validated = xpaths.validate(loc)
         val by = AppiumBy.xpath((validated?.xpath ?: loc.value))
         val el = runCatching { ctx.driver.findElement(by) }.getOrNull() ?: return false
+        ScrollUtil.ensureInView(ctx.driver, el)
         el.click()
         ctx.lastTapY = runCatching { el.rect.let { it.y + it.height / 2 } }.getOrNull()
         ctx.setScope(vision.determineScopeByY(ctx.lastTapY, v) ?: ctx.activeScope)
