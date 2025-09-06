@@ -11,8 +11,6 @@ import agent.Snapshot
 import agent.SnapshotStore
 import agent.llm.GeminiDisambiguator
 import agent.llm.LlmDisambiguator
-import agent.memory.ComponentMemory
-import agent.memory.ComponentMemoryAdapter
 import agent.memory.MemActivity
 import agent.memory.MemApp
 import agent.memory.MemEntry
@@ -51,7 +49,6 @@ import androidx.compose.ui.unit.dp
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import contentScale.ContentScale
-import generator.LlmScriptGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -1308,7 +1305,6 @@ fun AgentComponent(
     var isGenerating by remember { mutableStateOf(false) }
     val intentParser = remember { IntentParser() }
 
-    // Run/stop plumbing
     var isRunActive by remember { mutableStateOf(false) }
     var stopRequested by remember { mutableStateOf(false) }
     var agentJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
@@ -1320,6 +1316,8 @@ fun AgentComponent(
             agent.semantic.GeminiEmbedder(ui.OllamaClient.apiKey)
         )
     }
+
+    var autoRunEnabled by remember { mutableStateOf(true) }
 
     CardBox {
         Column {
@@ -1376,23 +1374,68 @@ fun AgentComponent(
 
             Spacer(Modifier.height(8.dp))
 
+            /* Row(verticalAlignment = Alignment.CenterVertically) {
+                *//* Text("Auto Run", modifier = Modifier.padding(end = 8.dp))
+                Switch(checked = autoRunEnabled, onCheckedChange = { autoRunEnabled = it })*//*
+
+                Text("Auto Run", style = MaterialTheme.typography.body1)
+                AlphaToggleButton(
+                    checked = autoRunEnabled,
+                    onCheckedChange = { autoRunEnabled = it }
+                )
+            }*/
+
+            Spacer(Modifier.height(8.dp))
+
             Row {
-                // RUN
                 AlphaButton(text = "Run agent") {
                     if (isRunActive) {
-                        onStatus("Run already in progress…"); return@AlphaButton
+                        onStatus("Run already in progress.")
+                        return@AlphaButton
                     }
-                    if (selectedDevice.isBlank()) { onStatus("Select a device first."); onLog("Preflight: no device"); return@AlphaButton }
-                    if (!util.AppiumHealth.isReachable()) { onStatus("❌ Appium not reachable at 127.0.0.1:4723"); onLog("Preflight: appium down"); return@AlphaButton }
-                    if (!adb.AdbExecutor.isPackageInstalled(selectedDevice, packageName)) { onStatus("❌ Package $packageName not installed"); onLog("Preflight: package missing"); return@AlphaButton }
+                    onShowAgentView()
+                    onLog("preflight:begin")
+                    when {
+                        selectedDevice.isBlank() -> {
+                            onStatus("Select a device first."); onLog("preflight:fail no-device"); return@AlphaButton
+                        }
 
-                    val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
+                        !util.AppiumHealth.isReachable() -> {
+                            onStatus("❌ Appium not reachable at 127.0.0.1:4723"); onLog("preflight:fail appium-down"); return@AlphaButton
+                        }
+
+                        !adb.AdbExecutor.isPackageInstalled(selectedDevice, packageName) -> {
+                            onStatus("❌ Package $packageName not installed"); onLog("preflight:fail package-missing"); return@AlphaButton
+                        }
+                    }
+                    onLog("preflight:ok")
+
+                    val goal = nlTask.ifBlank { plan?.title ?: "AutoRun" }
+                    val userPlanOrNull = plan
+                    val effective = agent.planner.AutoRunResolver.resolve(
+                        goal = goal,
+                        userPlan = userPlanOrNull,
+                        runsDir = File(System.getProperty("user.dir")).resolve("FrontEnd/AI Automation/runs"),
+                        enableAutoRun = autoRunEnabled,
+                        log = onLog
+                    )
+
+                    val mode =
+                        if (!autoRunEnabled) "user" else if (userPlanOrNull == null || userPlanOrNull.steps.isEmpty()) {
+                            if (effective.steps.isNotEmpty()) "graph" else "graph-empty"
+                        } else {
+                            if (effective.steps.size > userPlanOrNull.steps.size) "graph+user" else "user"
+                        }
+                    onLog("autorun:mode=$mode steps=${effective.steps.size}")
+                    if (effective.steps.isEmpty()) {
+                        onStatus("No steps found. Try Parse Task or disable Auto Run.")
+                        return@AlphaButton
+                    }
 
                     stopRequested = false
                     isRunActive = true
-                    lastPlanSteps = p.steps.size
-                    onShowAgentView()
-                    onRunState(true, p.steps.size)
+                    lastPlanSteps = effective.steps.size
+                    onRunState(true, effective.steps.size)
                     onStatus("Starting driver/session…")
                     timeline = emptyList()
                     onTimelineUpdate(timeline)
@@ -1419,10 +1462,9 @@ fun AgentComponent(
                             val reranker = agent.semantic.SemanticReranker(embedder)
                             val memDir = File("memory").absoluteFile.apply { mkdirs() }
 
-                            val compMem = ComponentMemory(memDir)
-                            val selectorMem = ComponentMemoryAdapter(compMem)
+                            val compMem = agent.memory.ComponentMemory(memDir)
+                            val selectorMem = agent.memory.ComponentMemoryAdapter(compMem)
                             onLog("memory:store=${compMem.filePath()} entries=${compMem.stats().entries} selectors=${compMem.stats().selectors}")
-
                             onLog("memory:store=${memDir.absolutePath} entries=${compMem.stats().entries} selectors=${compMem.stats().selectors}")
 
                             val result = AgentRunner(
@@ -1435,7 +1477,7 @@ fun AgentComponent(
                                 memory = selectorMem,
                                 memoryEvent = { msg -> ui.component.MemoryBus.saved(msg) }
                             ).run(
-                                plan = p,
+                                plan = effective,
                                 onStep = { snap ->
                                     timeline = timeline + snap
                                     onTimelineUpdate(timeline)
@@ -1450,7 +1492,7 @@ fun AgentComponent(
                             onLog("memory:after-run entries=${compMem.stats().entries} selectors=${compMem.stats().selectors}")
                             onStatus("Done: ${result.count { it.success }}/${result.size} steps OK")
                         } catch (e: Exception) {
-                            model.plan.PlanRecorder.recordFailure(plan!!)
+                            model.plan.PlanRecorder.recordFailure(effective)
                             if (stopRequested) {
                                 onStatus("⏹️ Stopped by user")
                                 onLog("⏹️ Stopped by user")
@@ -1470,31 +1512,10 @@ fun AgentComponent(
                 }
 
                 Spacer(Modifier.width(8.dp))
-
-                // Generate with AI
-                AlphaButton(text = "Generate with AI") {
-                    if (isRunActive) {
-                        onStatus("Please stop the run first."); return@AlphaButton
-                    }
-                    val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
-                    if (timeline.isEmpty()) { onStatus("Run the agent first."); return@AlphaButton }
-                    onShowAgentView()
-                    onStatus("Generating scripts with AI…")
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            LlmScriptGenerator(OllamaClient, File(outputDir)).generate(p, timeline)
-                            onStatus("Scripts written to $outputDir")
-                        } catch (e: Exception) {
-                            onStatus("Generation error: ${e.message}")
-                            onLog("Generation error: $e")
-                        }
-                    }
-                }
             }
 
             Spacer(Modifier.height(8.dp))
 
-            // STOP — always visible so it's never "missing"
             AnimatedVisibility(isRunActive) {
                 AlphaButton(text = "Stop") {
                     if (!isRunActive) {
@@ -1512,29 +1533,26 @@ fun AgentComponent(
             }
 
             Spacer(Modifier.height(8.dp))
-
             Row {
                 AlphaButton(text = "Generate scripts", isLoading = isGenerating) {
                     if (isRunActive) {
-                        onStatus("Please stop the run first."); return@AlphaButton
+                        onStatus("Please stop the run first.")
+                        return@AlphaButton
                     }
                     val p = plan ?: run { onStatus("Parse the task first."); return@AlphaButton }
                     if (timeline.isEmpty()) {
-                        onStatus("Run the agent first."); return@AlphaButton
+                        onStatus("Run the agent first.")
+                        return@AlphaButton
                     }
-
                     onShowAgentView()
                     onStatus("Generating scripts with AI…")
                     onGenReset()
                     onGenStart(6)
                     isGenerating = true
-
                     scope.launch(Dispatchers.IO) {
                         try {
-                            val out = LlmScriptGenerator(OllamaClient, File(outputDir))
-                                .generate(p, timeline) { step, total, msg ->
-                                    onGenProgress(step, total, msg)
-                                }
+                            val out = generator.LlmScriptGenerator(OllamaClient, File(outputDir))
+                                .generate(p, timeline) { step, total, msg -> onGenProgress(step, total, msg) }
                             onGenDone(out)
                             onStatus("✅ Scripts written to ${out.absolutePath}")
                         } catch (e: Exception) {
@@ -1558,6 +1576,7 @@ fun AgentComponent(
         }
     }
 }
+
 
 private fun guessScreenTitle(activity: String?, hint: String?): String {
     val a = (activity ?: "").substringAfterLast('.').lowercase()
